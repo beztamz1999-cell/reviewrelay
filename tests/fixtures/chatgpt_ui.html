@@ -1,0 +1,144 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>ReviewRelay local ChatGPT UI fixture</title>
+  <style>
+    body { font: 16px sans-serif; max-width: 50rem; margin: 2rem auto; }
+    [data-message-author-role] { white-space: pre-wrap; border: 1px solid #bbb; padding: .6rem; margin: .6rem 0; }
+    #composer { min-height: 3rem; border: 1px solid #555; padding: .5rem; }
+    #attachments > div { display: inline-block; padding: .3rem; margin: .2rem; background: #eee; }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>Conversation</h1>
+    <section id="conversation">
+      <article data-message-author-role="user" data-message-id="old-user-1">Earlier user request</article>
+      <article data-message-author-role="assistant" data-message-id="old-assistant-1">Earlier response: PASS is only old content.</article>
+    </section>
+    <div id="attachments"></div>
+    <div id="upload-errors"></div>
+    <input id="files" type="file" multiple aria-label="Attach files">
+    <div id="composer" role="textbox" aria-label="Message ChatGPT" contenteditable="true"></div>
+    <button id="send" type="button" aria-label="Send message" data-testid="send-button" disabled>Send</button>
+    <button id="stop" type="button" data-testid="stop-button" hidden>Stop generating</button>
+  </main>
+  <script>
+    const params = new URLSearchParams(location.search);
+    const mode = params.get("mode") || "normal";
+    const conversation = document.querySelector("#conversation");
+    const composer = document.querySelector("#composer");
+    const send = document.querySelector("#send");
+    const stop = document.querySelector("#stop");
+    let nextId = 1;
+    window.sendClicks = 0;
+
+    if (mode === "login") {
+      const login = document.createElement("button");
+      login.textContent = "Log in";
+      document.body.append(login);
+    }
+    if (mode === "missing-composer") composer.remove();
+    if (mode === "search-only") {
+      composer.remove();
+      const search = document.createElement("input");
+      search.type = "search";
+      search.setAttribute("aria-label", "Search conversations");
+      document.body.append(search);
+    }
+    if (mode === "disabled-composer") composer.setAttribute("contenteditable", "false");
+    if (mode === "draft") {
+      composer.innerText = "Owner draft that must not be overwritten";
+      send.disabled = false;
+    }
+    if (mode === "no-send-button") send.remove();
+
+    composer?.addEventListener("input", () => {
+      send.disabled = composer.innerText.length === 0;
+    });
+    document.querySelector("#files").addEventListener("change", event => {
+      const files = Array.from(event.target.files || []);
+      if (mode === "upload-error") {
+        const error = document.createElement("div");
+        error.dataset.testid = "upload-error";
+        error.textContent = "Upload failed";
+        document.querySelector("#upload-errors").append(error);
+        return;
+      }
+      for (const file of files) {
+        const chip = document.createElement("div");
+        chip.dataset.testid = "attachment-chip";
+        chip.textContent = file.name;
+        document.querySelector("#attachments").append(chip);
+      }
+      if (mode === "attachment-extra") {
+        const extra = document.createElement("div");
+        extra.dataset.testid = "attachment-chip";
+        extra.textContent = "manual-owner-file.txt";
+        document.querySelector("#attachments").append(extra);
+      }
+      if (mode === "concurrent-upload") {
+        const other = document.createElement("article");
+        other.dataset.messageAuthorRole = "user";
+        other.dataset.messageId = `manual-user-${nextId++}`;
+        other.textContent = "Manual message during attachment upload";
+        conversation.append(other);
+      }
+    });
+
+    send.addEventListener("click", () => {
+      window.sendClicks += 1;
+      if (mode === "navigation") {
+        location.assign("/outside");
+        return;
+      }
+      if (mode === "ambiguous-send") return;
+      const text = composer.innerText;
+      const user = document.createElement("article");
+      user.dataset.messageAuthorRole = "user";
+      user.dataset.messageId = `relay-user-${nextId++}`;
+      user.textContent = text;
+      conversation.append(user);
+      composer.innerText = "";
+      send.disabled = true;
+
+      if (mode === "extra-user") {
+        const other = document.createElement("article");
+        other.dataset.messageAuthorRole = "user";
+        other.dataset.messageId = `manual-user-${nextId++}`;
+        other.textContent = "Manual concurrent message";
+        conversation.append(other);
+      }
+      if (mode === "timeout") return;
+
+      const responseText = mode === "integration"
+        ? "Review summary.\n<RELAY_CONTROL>{\"protocol\":\"rr.v1\",\"candidate_sha\":\"abc123\",\"cycle\":1,\"action\":\"PASS\"}</RELAY_CONTROL>\nEnd summary."
+        : "Markdown **kept**.\nProse before.\n<RELAY_CONTROL>{\"protocol\":\"rr.v1\",\"candidate_sha\":\"abc123\",\"cycle\":1,\"action\":\"PASS\"}</RELAY_CONTROL>\nProse after.";
+      stop.hidden = false;
+      const assistant = document.createElement("article");
+      assistant.dataset.messageAuthorRole = "assistant";
+      assistant.dataset.messageId = `relay-assistant-${nextId++}`;
+      conversation.append(assistant);
+
+      let index = 0;
+      const timer = setInterval(() => {
+        index = Math.min(responseText.length, index + 7);
+        assistant.textContent = responseText.slice(0, index);
+        if (index === responseText.length) {
+          clearInterval(timer);
+          stop.hidden = true;
+          send.disabled = false;
+          if (mode === "multiple-assistant") {
+            const extra = document.createElement("article");
+            extra.dataset.messageAuthorRole = "assistant";
+            extra.dataset.messageId = `unexpected-assistant-${nextId++}`;
+            extra.textContent = "Unexpected second assistant turn";
+            conversation.append(extra);
+          }
+        }
+      }, 8);
+    });
+  </script>
+</body>
+</html>

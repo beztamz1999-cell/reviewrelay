@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "reviewrelay"
 version = "0.1.0"
-description = "Standalone Phase 1 core and Git evidence foundation for ReviewRelay"
+description = "Local Phase 1 foundation and Phase 2 review protocol for ReviewRelay"
 readme = "README.md"
 requires-python = ">=3.11,<3.15"
 dependencies = ["PyYAML>=6.0"]

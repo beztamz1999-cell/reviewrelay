@@ -69,3 +69,68 @@ class CandidateInvalidDirtyWorktree(GitError):
 
 class CandidateMutatedDuringReview(GitError):
     code = "CANDIDATE_MUTATED_DURING_REVIEW"
+
+
+class ReviewProtocolError(ReviewRelayError):
+    """Base class for typed failures while parsing untrusted reviewer text."""
+
+    code = "REVIEW_PROTOCOL_ERROR"
+
+
+class MissingControlBlock(ReviewProtocolError):
+    code = "MISSING_CONTROL_BLOCK"
+
+
+class MultipleControlBlocks(ReviewProtocolError):
+    code = "MULTIPLE_CONTROL_BLOCKS"
+
+
+class MalformedControlJSON(ReviewProtocolError):
+    code = "MALFORMED_CONTROL_JSON"
+
+
+class UnsupportedProtocol(ReviewProtocolError):
+    code = "UNSUPPORTED_PROTOCOL"
+
+
+class UnknownReviewAction(ReviewProtocolError):
+    code = "UNKNOWN_REVIEW_ACTION"
+
+
+class InvalidReviewPayload(ReviewProtocolError):
+    code = "INVALID_REVIEW_PAYLOAD"
+
+
+class StaleReview(ReviewProtocolError):
+    code = "STALE_REVIEW"
+
+
+class InvalidFinding(ReviewProtocolError):
+    code = "INVALID_FINDING"
+
+
+class InvalidEvidenceRequest(ReviewProtocolError):
+    code = "INVALID_EVIDENCE_REQUEST"
+
+
+class UnsafeEvidenceRequest(ReviewProtocolError):
+    code = "UNSAFE_EVIDENCE_REQUEST"
+
+
+class UnknownTestId(ReviewProtocolError):
+    code = "UNKNOWN_TEST_ID"
+
+
+class CycleLimitExceeded(ReviewProtocolError):
+    """A typed signal to stop automatic routing and escalate to the Owner."""
+
+    code = "CYCLE_LIMIT_EXCEEDED"
+    action = "OWNER_ESCALATION_REQUIRED"
+
+
+class ReviewCycleLimitExceeded(CycleLimitExceeded):
+    code = "REVIEW_CYCLE_LIMIT_EXCEEDED"
+
+
+class EvidenceCycleLimitExceeded(CycleLimitExceeded):
+    code = "EVIDENCE_CYCLE_LIMIT_EXCEEDED"

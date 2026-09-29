@@ -42,6 +42,8 @@ class TaskRecord:
     base_sha: str | None = None
     candidate_sha: str | None = None
     review_cycle: int = 0
+    fix_cycle_count: int = 0
+    evidence_cycle_count: int = 0
     worker_reported_sha_mismatch: bool = False
     reviewer_chat_identity: str | None = None
     worker_session_identity: str | None = None

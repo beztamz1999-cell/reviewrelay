@@ -47,6 +47,11 @@ class TaskRecord:
     worker_reported_sha_mismatch: bool = False
     reviewer_chat_identity: str | None = None
     worker_session_identity: str | None = None
+    worker_thread_id: str | None = None
+    worker_repo_path: str | None = None
+    worker_last_turn_id: str | None = None
+    worker_last_turn_status: str | None = None
+    worker_last_event_at: str | None = None
     last_sent_review_key: str | None = None
     last_review_action: str | None = None
     pack_hash: str | None = None

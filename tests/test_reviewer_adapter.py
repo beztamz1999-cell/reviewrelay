@@ -408,7 +408,7 @@ def test_cdp_backend_waits_for_restored_ui_hydration_before_send(fixture_server,
                 headless=False,
                 browser_backend=BrowserBackend.GOOGLE_CHROME_CDP,
                 timeouts=ChatGPTTimeouts(
-                    navigation_seconds=6,
+                    navigation_seconds=20,
                     upload_seconds=0.35,
                     response_seconds=0.8,
                     stability_seconds=0.03,

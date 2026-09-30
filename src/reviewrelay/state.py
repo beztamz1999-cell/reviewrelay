@@ -11,7 +11,7 @@ from .models import TaskRecord, TaskState, utc_now_iso
 from .storage import PortableDataRoot
 
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 
 class StateStore:
@@ -35,6 +35,9 @@ class StateStore:
             self._create_current_schema()
         elif version == 1:
             self._migrate_v1_to_v2()
+            self._migrate_v2_to_v3()
+        elif version == 2:
+            self._migrate_v2_to_v3()
         elif version != SCHEMA_VERSION:
             self._connection.close()
             raise SchemaVersionError(f"No migration path from database version {version}")
@@ -55,6 +58,11 @@ class StateStore:
                     worker_reported_sha_mismatch INTEGER NOT NULL DEFAULT 0 CHECK (worker_reported_sha_mismatch IN (0, 1)),
                     reviewer_chat_identity TEXT,
                     worker_session_identity TEXT,
+                    worker_thread_id TEXT,
+                    worker_repo_path TEXT,
+                    worker_last_turn_id TEXT,
+                    worker_last_turn_status TEXT,
+                    worker_last_event_at TEXT,
                     last_sent_review_key TEXT,
                     last_review_action TEXT,
                     pack_hash TEXT,
@@ -63,6 +71,7 @@ class StateStore:
                     PRIMARY KEY (project_id, task_id)
                 )
             """)
+            self._connection.execute("CREATE UNIQUE INDEX worker_thread_identity ON tasks(worker_thread_id) WHERE worker_thread_id IS NOT NULL")
             self._connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
 
     def _migrate_v1_to_v2(self) -> None:
@@ -74,6 +83,15 @@ class StateStore:
             self._connection.execute(
                 "ALTER TABLE tasks ADD COLUMN evidence_cycle_count INTEGER NOT NULL DEFAULT 0 CHECK (evidence_cycle_count >= 0)"
             )
+            self._connection.execute("PRAGMA user_version = 2")
+
+    def _migrate_v2_to_v3(self) -> None:
+        """Retain all earlier state and add worker thread/repository binding."""
+        with self._connection:
+            for column in ("worker_thread_id", "worker_repo_path", "worker_last_turn_id",
+                           "worker_last_turn_status", "worker_last_event_at"):
+                self._connection.execute(f"ALTER TABLE tasks ADD COLUMN {column} TEXT")
+            self._connection.execute("CREATE UNIQUE INDEX worker_thread_identity ON tasks(worker_thread_id) WHERE worker_thread_id IS NOT NULL")
             self._connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
 
     def save(self, record: TaskRecord) -> None:
@@ -98,8 +116,9 @@ class StateStore:
                     project_id, task_id, task_state, base_sha, candidate_sha,
                     review_cycle, fix_cycle_count, evidence_cycle_count, worker_reported_sha_mismatch,
                     reviewer_chat_identity, worker_session_identity,
+                    worker_thread_id, worker_repo_path, worker_last_turn_id, worker_last_turn_status, worker_last_event_at,
                     last_sent_review_key, last_review_action, pack_hash, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(project_id, task_id) DO UPDATE SET
                     task_state=excluded.task_state,
                     base_sha=excluded.base_sha,
@@ -110,6 +129,11 @@ class StateStore:
                     worker_reported_sha_mismatch=excluded.worker_reported_sha_mismatch,
                     reviewer_chat_identity=excluded.reviewer_chat_identity,
                     worker_session_identity=excluded.worker_session_identity,
+                    worker_thread_id=excluded.worker_thread_id,
+                    worker_repo_path=excluded.worker_repo_path,
+                    worker_last_turn_id=excluded.worker_last_turn_id,
+                    worker_last_turn_status=excluded.worker_last_turn_status,
+                    worker_last_event_at=excluded.worker_last_event_at,
                     last_sent_review_key=excluded.last_sent_review_key,
                     last_review_action=excluded.last_review_action,
                     pack_hash=excluded.pack_hash,
@@ -118,7 +142,9 @@ class StateStore:
                 record.project_id, record.task_id, record.task_state.value, record.base_sha,
                 record.candidate_sha, record.review_cycle, record.fix_cycle_count, record.evidence_cycle_count,
                 int(record.worker_reported_sha_mismatch), record.reviewer_chat_identity,
-                record.worker_session_identity, record.last_sent_review_key, record.last_review_action,
+                record.worker_session_identity, record.worker_thread_id, record.worker_repo_path,
+                record.worker_last_turn_id, record.worker_last_turn_status, record.worker_last_event_at,
+                record.last_sent_review_key, record.last_review_action,
                 record.pack_hash, record.created_at, updated_at,
             ))
 
@@ -140,6 +166,9 @@ class StateStore:
             fix_cycle_count=row["fix_cycle_count"], evidence_cycle_count=row["evidence_cycle_count"],
             worker_reported_sha_mismatch=bool(row["worker_reported_sha_mismatch"]),
             reviewer_chat_identity=row["reviewer_chat_identity"], worker_session_identity=row["worker_session_identity"],
+            worker_thread_id=row["worker_thread_id"], worker_repo_path=row["worker_repo_path"],
+            worker_last_turn_id=row["worker_last_turn_id"], worker_last_turn_status=row["worker_last_turn_status"],
+            worker_last_event_at=row["worker_last_event_at"],
             last_sent_review_key=row["last_sent_review_key"], last_review_action=row["last_review_action"],
             pack_hash=row["pack_hash"], created_at=row["created_at"], updated_at=row["updated_at"],
         )

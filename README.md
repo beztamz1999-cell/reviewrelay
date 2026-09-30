@@ -4,7 +4,7 @@ ReviewRelay is a small standalone foundation for relaying implementation work to
 
 ## Status
 
-Phases 1, 2, and 3 are implemented. Phase 3 provides an explicit ChatGPT web transport. It does not start workers, run evidence requests, or provide a user interface. The live ChatGPT smoke procedure is manual and is not part of automated tests.
+Phases 1–4 are implemented. Phase 3 provides the ChatGPT web transport; Phase 4 provides a separately invoked Codex app-server worker adapter. Live smoke procedures are explicit development tools and are not part of automated tests.
 
 ## Development
 
@@ -73,4 +73,22 @@ The smoke prints the raw response and requires the new owned response to contain
 
 ## Deferred scope
 
-Codex Worker Adapter, evidence execution engine, autonomous review loop, secret scanner, Windows UI, cloud service, arbitrary shell execution, and production/release logic remain deferred. Configured test commands remain registry data and are not executed by ReviewRelay.
+Evidence execution engine, autonomous review loop, secret scanner, Windows UI, cloud service, arbitrary reviewer-driven shell execution, and production/release logic remain deferred. Configured test commands remain registry data and are not executed by ReviewRelay.
+
+## Phase 4 worker adapter
+
+`WorkerAdapter` is an async boundary. `CodexAppServerAdapter` launches `codex app-server --listen stdio://` directly with separate pipes, performs `initialize` / `initialized`, and creates or resumes a persistent Codex thread. Call Phase 1 `begin_task` before `start_task`. Supply exactly one prompt text or prompt file; call `wait_until_done` and `get_final_response` to capture the completed response. `send_instruction` continues the saved thread, and a new adapter uses `resume_task` after restart. Always await `close` in a `finally` block.
+
+SQLite schema 3 binds one task to one repository and Codex thread, records the latest turn/status/event timestamp, and preserves earlier state. A task lock prevents concurrent adapters. Only `turn/completed` with `completed` status is transport success. Failed, interrupted, timeout, dead-process, and malformed-protocol outcomes have typed errors; no replacement thread or exec fallback is created automatically. Responses are narrative, and reports are persisted through `TaskStorage.persist_worker_report`.
+
+Optional `worker` configuration supports `executable`, `model`, `reasoning_effort`, `sandbox` (`workspace-write` or `read-only`), and `timeouts` (`startup_seconds`, `initialize_seconds`, `request_seconds`, `idle_seconds`, `overall_seconds`, `shutdown_seconds`). Omitted model/effort use Codex configuration. Existing local Codex login is reused through Codex itself; ReviewRelay does not read credential files. Interactive server requests stop with a typed error for caller handling.
+
+The bounded `timeline` contains observable messages, command/file/tool activity, and lifecycle events. Known auth fields are redacted and reasoning/raw model events are omitted from diagnostic traces. Per-turn JSONL and bounded stderr diagnostics live under managed task `scratch/worker`, so existing scratch GC disposes of them. This is diagnostic redaction, not the deferred secret scanner.
+
+Run the explicit two-turn live smoke in disposable managed storage:
+
+```powershell
+python -m reviewrelay.dev.codex_smoke --data-root "G:\REVIEW_RELAY_DATA" --model <configured-supported-model> --reasoning-effort low
+```
+
+It creates a harmless file, shuts down app-server, resumes the exact saved thread in a new process, reads the file, and removes the disposable repository. `model/list` is informational; only a completed live inference verifies account access. Automated worker tests use a fake stdio subprocess and consume no Codex quota.

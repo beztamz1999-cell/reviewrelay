@@ -6,7 +6,7 @@
 BASE_SHA=bdcfcfe458e42d0eba315861af4524d51c500efc
 BRANCH=main
 INITIAL_WORKTREE_CLEAN=YES
-FINAL_CANDIDATE_SHA=RECORDED_AFTER_COMMIT
+IMPLEMENTATION_COMMIT_SHA=68a180233956bafc902d423c56a647b24ae201dd
 ```
 
 The requested reviewer conversation was `https://chatgpt.com/c/6abc2ec9-1848-83ec-b1cd-a105f0941738`. No other conversation URL was used. Phase 4 was not started.
@@ -99,3 +99,23 @@ It exited before message preparation because conversation navigation returned HT
 - No cookies or tokens were read, exported, injected, or copied. No credentials or Google login were automated.
 - Prompt/response content was not sent or captured. Only the generated harmless `relay-smoke.txt` was prepared.
 - Live acceptance remains blocked by HTTP 403 on the configured conversation. A valid account session alone was insufficient evidence of access to that conversation. No bypass was attempted.
+
+
+## Follow-up browser boundary diagnostic (2026-09-30)
+
+The diagnostic used the same exact reviewer URL and the same dedicated ReviewRelay profile. The ReviewRelay profile lock was held across both browser modes. Auth Mode was launched with installed Google Chrome, without CDP or Playwright. Automation Mode used the same Chrome executable and profile with `--remote-debugging-address=127.0.0.1`; Playwright remained unattached during the manual B observation.
+
+```text
+NORMAL_CHROME_CONVERSATION_ACCESS=PASS
+CDP_ONLY_CONVERSATION_ACCESS=FAIL
+CDP_PLAYWRIGHT_EXISTING_TAB_ACCESS=NOT_RUN
+CDP_ONLY_HTTP_STATUS=NOT_CAPTURED_BY_OWNER
+DIRECT_PAGE_GOTO_HTTP_STATUS=403 (PREVIOUS RUNS; SAME EXACT URL)
+DIRECT_NAVIGATION_RETRIED_AFTER_MATRIX=NO
+```
+
+For A, the Owner manually opened the exact conversation in normal Auth Mode Chrome and reported that the conversation and composer were usable. For B, the Owner manually opened the same exact URL in Chrome with localhost-only CDP and no Playwright attached, and reported that the conversation/composer were not usable. The Owner did not report an HTTP status for B. C was not run because its stated precondition, B passing, was false. No Playwright attachment or page navigation occurred during B.
+
+The first observed failing boundary is the transition from normal Chrome Auth Mode to CDP-enabled Chrome Automation Mode, before Playwright attaches. Prior runs of `page.goto(exact_conversation_url)` in CDP + Playwright returned HTTP 403, but the B failure without Playwright means `page.goto()` is not the only condition associated with the access failure. The evidence localizes the problem to the CDP-enabled browser/session path; it does not isolate the CDP flag from other startup-mode differences, and the B HTTP status was not captured. The same URL was not requested again after the matrix because the 403 had already been observed.
+
+The dedicated profile had zero Chrome processes after the Owner selected Chrome menu → Exit. The profile lock was then released. No production code or selectors changed: B failed, so existing-tab reuse through Playwright was not established and the restored-tab strategy was not adopted. The prior regression result remains applicable to the unchanged code: `python -m pytest -q` — 267 passed in 28.78s.

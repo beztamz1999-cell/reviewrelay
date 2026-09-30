@@ -7,6 +7,96 @@
 
 ---
 
+## 0. Owner-Approved Architecture Revision — 2026-10-01
+
+This Phase 6 revision governs current source review and supersedes earlier attachment-first defaults and the original phase roadmap below. Historical reports describe their accepted phases; they are not new-task deliverable requirements.
+
+```text
+LOCAL = execution truth
+GITHUB = reviewer-readable mirror
+
+Committed task spec → Codex implementation + tests + local commit
+→ Relay verifies exact clean candidate
+→ Relay publishes immutable SHA to the task branch
+→ Relay verifies remote SHA == local candidate SHA
+→ compact ChatGPT notification → owned raw response → strict Phase 2 decision
+```
+
+### 0.1 Responsibilities and task contract
+
+Codex owns implementation, tests and local commits. ReviewRelay owns normal publishing and optional PR management. GitHub does not replace local Git verification. Normal source review does not upload patches, worker reports, implementation/audit reports, source snapshots or review packs. These APIs remain legacy/internal capabilities and require explicit use; a review pack is not a prerequisite or automatic fallback.
+
+Use one canonical committed `.reviewrelay/tasks/<TASK_ID>.md`. Intentionally create it before implementation if absent, commit it into the clean baseline, call Phase 1 `begin_task`, then `GitHubCandidatePublisher.bind_task` before any worker turn or candidate/review cycle. Binding records the applicable baseline spec blob, repository, destination and spec-change intent. Ordinary candidate commits must preserve that blob. An intentionally spec-changing task binds `allow_spec_change=True` before worker execution; the reviewer still reads the exact candidate's spec. Intent cannot be retroactively changed by a fix or restart.
+
+No new per-task `implementation-report.md` or `audit.md` is required. Capture worker output when useful without treating it as evidence or requiring narrative files in the repository. ReviewRelay development updates canonical architecture documentation. Historical reports are preserved.
+
+### 0.2 Publishing boundary and configuration
+
+`CandidatePublisher` provides async `publish`, read-only external `reconcile`, and `verify_current`. `GitHubCandidatePublisher` is the narrow implementation; it is not a general GitHub SDK. Configuration is optional, defaults to disabled, and accepts only:
+
+```yaml
+github:
+  enabled: true
+  remote: origin
+  base_branch: main
+  mode: pr  # branch also supported; default mode is branch
+```
+
+The named remote must resolve to exactly one credential-free supported GitHub destination: HTTPS on `github.com` or `git@github.com:owner/repository.git`. Reuse supported local Git authentication; unavailable authentication returns `GITHUB_AUTH_REQUIRED`. Never store tokens in configuration or copy credentials into ChatGPT. PR mode uses optional official GitHub CLI tooling; missing `gh` returns `GITHUB_CLI_UNAVAILABLE`. Branch mode uses Git alone. Other Git hosts/enterprise endpoints are outside this implementation. Local bare remotes are permitted only by an explicit offline test seam, disabled in production.
+
+One deterministic `reviewrelay/<sanitized-task>-<digest>` branch belongs to each task, with a suffix to distinguish sanitized IDs. Fix commits advance that same branch without force. Before every push, require valid local repository, actual HEAD equal to the exact committed candidate, clean worktree, current task/cycle/config/spec bindings, and ancestor relationships. Push a fixed `<candidate_sha>:refs/heads/<task_branch>` refspec; disable automatic tag/submodule pushes. Never push a moving HEAD or rewrite unexpected remote history. Divergence returns `GITHUB_BRANCH_DIVERGED`.
+
+Git/gh use fixed argv with no shell, bounded process lifetime and output, noninteractive auth settings and generic credential-free error diagnostics. After push, query the remote branch and require exact SHA equality, otherwise `REMOTE_CANDIDATE_MISMATCH`; no notification becomes ready. PR mode discovers or creates one draft PR with configured base and task head. Reuse the same PR across fixes/restarts, verify canonical URL/number, open state, same repository and exact PR HEAD. Closed, ambiguous or mismatched PRs stop publishing; no replacement PR is silently created.
+
+### 0.3 Durable effects and recovery
+
+SQLite schema 4 migrates the existing `db/relay.db`, retaining Phase 1–5 task/worker state and adding `github_publications`, `github_events`, `github_reviews`. Persist remote, base branch, task branch, PR identity, last local/remote SHAs, publish status/time, spec binding, review cycle, notification identity, raw response and parsed decision. Migration and publication checkpoints are transactional. Per-task OS locks serialize publishing and review bridge operations.
+
+```text
+LOCAL_CANDIDATE_READY → GITHUB_PUSH_PLANNED → GITHUB_PUSH_IN_FLIGHT
+→ GITHUB_PUSH_CONFIRMED → REMOTE_SHA_VERIFIED → READY_TO_NOTIFY_REVIEWER
+```
+
+Record intent before dispatch. An uncertain push stays unresolved until a read-only remote query proves the exact candidate; never blindly retry it. If the exact SHA is already present, emit `PUBLISH_ALREADY_CONFIRMED` without another push. `reconcile` can update local state and discover an existing PR, but performs no external mutation. A missing not-yet-attempted PR returns `GITHUB_PR_REQUIRED`; a separately invoked `publish` may create it after remote verification. An in-flight/ambiguous PR attempt without a discoverable canonical PR returns `GITHUB_PR_AMBIGUOUS`, preventing duplicate creation.
+
+Normalized events include `CANDIDATE_READY`, `GITHUB_PUSH_STARTED`, `GITHUB_PUSH_CONFIRMED`, `REMOTE_SHA_VERIFIED`, `PR_CREATED`, `PR_REUSED`, `REVIEW_NOTIFICATION_READY` and `REVIEW_NOTIFICATION_SENT`. They describe observable effects, not hidden model reasoning.
+
+### 0.4 Reviewer notification and identity
+
+```text
+REVIEWRELAY_REVIEW_REQUEST
+TASK_ID=<task>
+REPO=<owner/repository>
+PR=<canonical URL or NONE>
+BRANCH=<task branch>
+BASE_SHA=<baseline>
+HEAD_SHA=<exact verified remote candidate>
+REVIEW_CYCLE=<positive cycle>
+TASK_SPEC_PATH=.reviewrelay/tasks/<TASK_ID>.md
+```
+
+ChatGPT inspects that exact commit, BASE..HEAD diff, related source and tests directly from GitHub and returns one Phase 2 `rr.v1` RELAY_CONTROL block with matching candidate/cycle. Private-repository access through the ChatGPT account's GitHub connection is an Owner prerequisite, managed outside ReviewRelay. If access is unavailable, return `REVIEW_ERROR` with reason `GITHUB_REVIEW_ACCESS_REQUIRED`; no automatic attachment fallback or credential transfer is permitted.
+
+`GitHubReviewBridge` reuses the existing `ChatGPTWebAdapter.send_review_pack` with an empty attachment tuple and preserves single-send protection, turn ownership, completion and raw extraction. Durable planned/in-flight/confirmed notification state prevents restart resends. Recovery before raw capture needs the current adapter's owned SendResult; it does not invent process-local ownership. Raw captured responses and validated decisions can be reused from persistent storage. Local/remote bindings are checked before send, throughout response waiting and before returning the parsed decision. Local HEAD/worktree mutation yields `CANDIDATE_MUTATED_DURING_REVIEW`; remote branch mutation yields `REMOTE_CANDIDATE_MUTATED`; changed candidate/cycle rejects stale results. Invalidated decisions stay unusable even if an old repository state is restored.
+
+### 0.5 Local verification and current scope
+
+Phase 5 is the **Local Verification Executor**; the public `LocalEvidenceExecutor` name and all nine whitelisted DSL operations remain compatible. Use it for configured tests, Git status, runtime/environment outputs and generated-artifact verification that GitHub cannot supply reliably. Normal source retrieval occurs directly on GitHub. Phase 6 returns validated decisions only; it does not autonomously dispatch workers, fixes or evidence, mark release completion, merge, deploy, or start Phase 7.
+
+Live browser behavior remains centralized in the accepted Phase 3 backend: dedicated installed-Chrome profile, manual Auth Mode without CDP/Playwright, clean close, Automation Mode with localhost-only CDP, and reuse of the exact restored reviewer tab without programmatic navigation. No default Chrome profile, cookie/token extraction or injection, credential automation, auth bypass, private endpoint or alternate reviewer conversation. Offline fixtures retain Playwright Chromium.
+
+### 0.6 Acceptance and development workflow
+
+Offline tests use actual local bare Git remotes with fake PR/reviewer services, covering safe task branches, exact immutable push, remote/PR HEAD verification, no force/shell, idempotency, planned/in-flight/lost-ack recovery, read-only reconciliation, one PR, spec mutation, dirty/mutated/divergent candidates, bounded errors/auth failures, schema migration/restart, compact zero-attachment notifications, owned raw responses and stale-decision rejection. Preserve Phase 1–5 regression; the old schema-2 migration fixture now removes schema-4 tables when constructing its historical database.
+
+Required order: implementation → targeted tests → full regression → canonical docs → stage exact candidate → final full regression → compileall → staged/working diff checks → one local commit → clean worktree. Commands: `python -m pytest -q`, `python -m compileall -q src tests`, `git diff --check`, `git diff --cached --check`. No report-only follow-up commit.
+
+Live GitHub and reviewer-access smokes are optional, requiring an already Owner-authorized test destination. This development repository has no configured remote, so both are `NOT_RUN`; offline results do not prove live GitHub or ChatGPT connector access. No development-repository push, guessed destination or new authentication is authorized by this phase. Phase 7 needs a separate Owner-approved task.
+
+Official CLI references: [PR discovery](https://cli.github.com/manual/gh_pr_list), [explicit-head draft PR creation](https://cli.github.com/manual/gh_pr_create). See `README.md` for caller composition and `.reviewrelay/tasks/REVIEWRELAY_V1_PHASE6_GITHUB_BRIDGE.md` for this development task's scope.
+
+---
+
 ## 1. Product Definition
 
 ReviewRelay is a lightweight standalone tool that automates the review loop between:
@@ -33,11 +123,13 @@ Owner
   ↓
 Codex Worker
   ↓
-Implementation + tests + commit + final report
+Implementation + tests + local commit
   ↓
 ReviewRelay
   ↓
-Git/source/test evidence
+Verify clean exact candidate → publish SHA → verify remote SHA
+  ↓
+Compact GitHub review notification
   ↓
 ChatGPT Reviewer
   ↓
@@ -52,17 +144,17 @@ Repeat until PASS or escalation
 Owner
 ```
 
-The core quota model is:
+Autonomous routing in this target loop remains deferred. The core quota model is:
 
 ```text
 Codex implementation     → Codex quota
 Codex fix                → Codex quota
 
 Git diff                 → local / free
-Read source              → local / free
+Read source              → GitHub reviewer access (local DSL retained)
 grep                     → local / free
 Run configured tests     → local / free
-Build evidence pack      → local / free
+Publish/verify candidate → local deterministic Git processes
 
 ChatGPT review           → Chat quota
 ChatGPT reasoning        → Chat quota
@@ -87,7 +179,7 @@ ReviewRelay V1 must not become any of the following:
 - Full CI/CD system.
 - Release manager.
 - Production deployment tool.
-- Git hosting service integration.
+- General Git hosting service integration beyond the approved GitHub task-branch/PR mirror.
 - Cloud review service.
 - OpenAI API client.
 - Arbitrary shell execution system driven by reviewer output.
@@ -120,7 +212,7 @@ Codex Worker:
 - changes source code;
 - runs relevant development tests;
 - commits the exact tested candidate state;
-- returns a final textual implementation report.
+- returns a candidate completion marker; optional narrative is untrusted and no implementation/audit Markdown file is required.
 
 Codex Worker is **not** trusted as the sole source of audit truth.
 
@@ -128,9 +220,9 @@ Codex Worker is **not** trusted as the sole source of audit truth.
 
 ChatGPT Reviewer:
 
-- receives review packs;
+- receives a compact exact-candidate GitHub notification and reads source/diffs/tests directly from GitHub;
 - evaluates implementation correctness;
-- requests additional repository evidence when needed;
+- requests local/runtime verification when GitHub cannot supply it;
 - issues fix instructions;
 - decides whether the candidate is review-PASS;
 - escalates ambiguous decisions to the Owner.
@@ -144,11 +236,12 @@ ReviewRelay:
 - maintains task/review state;
 - captures worker final output;
 - verifies candidate SHA and worktree state;
-- creates patch/evidence independently;
-- uploads review material;
+- publishes the verified immutable candidate SHA and verifies remote equality;
+- sends compact GitHub notifications without source/report/patch attachments;
+- retains independent patch/evidence generation as legacy/local diagnostic capability;
 - parses reviewer control output;
 - fulfills safe evidence requests locally;
-- sends valid fix instructions back to the same worker session;
+- exposes the same worker-session instruction boundary for explicit caller use; autonomous routing is deferred;
 - protects against stale reviews and uncontrolled loops;
 - cleans disposable artifacts automatically.
 
@@ -181,13 +274,14 @@ Worker reports are useful for context but must not replace repository-derived ev
 ┌─────────────────────────────────────────────────────┐
 │                  ReviewRelay Core                   │
 │                                                     │
-│  State Controller                                   │
+│  Explicit caller (autonomous controller deferred)    │
 │       │                                             │
 │       ├── Git / Candidate Verifier                  │
 │       ├── Evidence Collector                        │
 │       ├── Test Registry Runner                      │
-│       ├── Secret Scanner                            │
-│       ├── Review Pack Builder                       │
+│       ├── GitHub Candidate Publisher                │
+│       ├── GitHub Review Bridge                      │
+│       ├── Legacy Review Pack Builder                 │
 │       ├── Reviewer Protocol Parser                  │
 │       ├── ChatGPT Web Adapter                       │
 │       ├── Codex Worker Adapter                      │
@@ -455,20 +549,17 @@ RELAY_WORKER_DONE
 TASK_ID=<task>
 HEAD_SHA=<worker-reported-sha>
 
-# Implementation Report
-
-...
 ```
 
-### 11.3 Worker report capture
+### 11.3 Optional legacy worker report capture
 
-ReviewRelay must capture the **final response text from the Codex worker session** and store it itself as:
+The final worker response is captured by the existing adapter. Legacy callers may persist it through TaskStorage as:
 
 ```text
 worker-report.md
 ```
 
-Codex must not be required to create this file manually.
+Codex is not required to create this file manually. Normal GitHub review requires no narrative report file or report attachment.
 
 ### 11.4 Worker-reported SHA is untrusted
 
@@ -494,13 +585,13 @@ Actual Git SHA is authoritative.
 
 ---
 
-## 12. Patch Generation
+## 12. Legacy / Local Diagnostic Patch Generation
 
 Codex does not generate the canonical patch.
 
 ReviewRelay generates it independently.
 
-Required Git evidence:
+When this diagnostic capability is explicitly selected, its Git evidence is:
 
 ```bash
 git diff BASE_SHA..HEAD_SHA
@@ -526,9 +617,9 @@ BASE_SHA..HEAD_SHA
 
 ---
 
-## 13. Review Pack
+## 13. Legacy Review Pack
 
-Default review pack:
+Preserved legacy review pack (not required by normal GitHub source review):
 
 ```text
 review-pack\
@@ -572,11 +663,11 @@ Recommended addition:
 
 ---
 
-## 14. Evidence Upload Strategy
+## 14. Legacy Evidence Upload Strategy
 
 Do not upload an entire repository.
 
-Default strategy:
+Explicit legacy strategy, never an automatic GitHub-access fallback:
 
 ```text
 PATCH_FIRST
@@ -603,7 +694,7 @@ For large changes, reviewer requests only the extra context it needs.
 
 ---
 
-## 15. Large Patch Handling
+## 15. Legacy Large Patch Handling
 
 Large patch files may be split by changed file.
 
@@ -630,11 +721,11 @@ Rules:
 
 `NEED_EVIDENCE` is a first-class reviewer action.
 
-The reviewer may request additional repository evidence.
+The reviewer reads source directly from GitHub and may request genuinely local/runtime verification. All original DSL operations remain supported for compatibility.
 
 ReviewRelay should fulfill the request locally whenever possible.
 
-Flow:
+Target future routing (not automated by Phase 6):
 
 ```text
 ChatGPT
@@ -942,10 +1033,11 @@ Commit the exact tested source state.
 REVIEW INSTRUCTION:
 <worker_instruction>
 
-When complete, return RELAY_WORKER_DONE and a final implementation report.
+When complete, return RELAY_WORKER_DONE and the exact local candidate SHA.
+Do not publish, manage PRs or create required implementation/audit reports.
 ```
 
-After worker completion, ReviewRelay independently verifies the new candidate and creates the next review cycle.
+The future caller/controller independently verifies the next candidate and review cycle. The Phase 6 publisher updates the same task branch/PR when explicitly invoked; it does not automatically dispatch this worker flow.
 
 ---
 
@@ -1319,12 +1411,20 @@ review:
   keep_final_patch: true
 
 chatgpt:
-  conversation_scope: task
-  browser_profile: "default"
+  conversation_url: "https://chatgpt.com/c/your-existing-conversation"
+  browser_profile: "reviewer-chrome"
+  browser_backend: "google-chrome-cdp"
+  headless: false
 
 worker:
-  adapter: codex
-  reuse_session: true
+  executable: codex
+  sandbox: workspace-write
+
+github:
+  enabled: true
+  remote: origin
+  base_branch: main
+  mode: pr
 
 tests:
   unit:
@@ -1495,10 +1595,15 @@ ReviewRelay should use a stable review instruction similar to:
 ```text
 Audit this exact candidate against the supplied task requirements.
 
-Use the attached Git/source/test evidence as the source of truth.
-Treat the worker report as narrative context, not authoritative evidence.
+Use exact repository, BASE_SHA, HEAD_SHA, branch/PR, review cycle and
+TASK_SPEC_PATH from REVIEWRELAY_REVIEW_REQUEST.
+Read the exact candidate's spec, source, diff and tests directly from GitHub.
+Local Git remains execution truth; GitHub is the verified review mirror.
+No patch, source, worker report or audit attachments are required.
+If GitHub access is unavailable, return REVIEW_ERROR with reason
+GITHUB_REVIEW_ACCESS_REQUIRED; do not request a large attachment fallback.
 
-If evidence is insufficient, request only the minimum additional evidence required.
+Use NEED_EVIDENCE only for minimum genuinely local/runtime verification.
 
 Do not request arbitrary shell commands.
 
@@ -1526,12 +1631,15 @@ Commit the exact tested source state.
 Do not begin unrelated work.
 Do not alter production systems.
 Return RELAY_WORKER_DONE only after the candidate is committed and ready for review.
-Provide a Markdown implementation report in your final response.
+Do not publish or manage PRs; ReviewRelay owns these operations.
+Do not change the committed task spec unless this task's initial binding
+explicitly authorizes an intentional spec change.
+No per-task implementation/audit Markdown report is required.
 ```
 
 ---
 
-## 50. Review-Pack Reproducibility
+## 50. Legacy Review-Pack Reproducibility
 
 Given:
 
@@ -1597,12 +1705,12 @@ Acceptance:
 
 Implement:
 
-- persistent Playwright/Chromium profile;
-- open configured conversation;
+- dedicated installed-Chrome Auth/Automation modes and localhost CDP;
+- exact restored reviewer tab reuse; deterministic offline Playwright Chromium;
 - upload files;
 - send review message;
-- capture latest assistant response;
-- reconnect/retry handling.
+- capture the completed owned assistant response;
+- fail-closed lifecycle/reconnect handling, without automatic resend.
 
 Acceptance:
 
@@ -1623,43 +1731,43 @@ Acceptance:
 
 - worker implementation/fix response can be captured without manual copy/paste.
 
-### Phase 5 — Autonomous Review Loop
+### Phase 5 — Local Verification Executor
 
 Implement:
 
-```text
-worker
-→ verify candidate
-→ build pack
-→ review
-→ evidence/fix
-→ review
-→ PASS/escalate
-```
+- validated candidate-bound local evidence batches;
+- all nine whitelisted DSL operations;
+- configured test IDs, bounded fixed-argv subprocesses;
+- candidate mutation checks, manifests and compatible upload-artifact capability.
 
 Acceptance:
 
-- one complete task can pass through at least one FIX_REQUIRED or NEED_EVIDENCE cycle without Owner copy/paste.
+- local/runtime facts are collected without consuming Codex quota;
+- Phase 6 preserves the complete Phase 5 interface and regression suite.
 
-### Phase 6 — Safety + Recovery
+### Phase 6 — GitHub Review Bridge
 
 Implement:
 
-- secret scanner;
-- crash recovery;
-- idempotent sends;
-- stale candidate protection;
-- GC;
-- owner escalation.
+- exact clean local-candidate publisher and task-spec binding;
+- one safely named remote task branch and one optional draft PR;
+- exact remote/PR HEAD verification, no force push;
+- durable publication/notification events and read-only ambiguity recovery;
+- compact GitHub review notification without source/report/patch attachments;
+- owned raw response capture and strict candidate/cycle-bound Phase 2 parsing.
 
 Acceptance:
 
-- restart does not duplicate review/fix actions;
-- unsafe artifacts are blocked.
+- offline bare-remote/fake-PR/fake-reviewer tests and Phase 1–5 regression pass;
+- no duplicate uncertain pushes/PRs/notifications or stale decisions;
+- optional live gates use an authorized remote or remain NOT_RUN;
+- autonomous worker/fix/evidence routing is not implemented.
 
 ### Phase 7 — Lightweight Windows UI + Packaging
 
-Implement:
+Future roadmap only. Do not start without a separate Owner-approved task. Autonomous routing and secret-scanner scope also remain deferred to explicit Owner decisions.
+
+Potential work:
 
 - project selector;
 - task state view;
@@ -1677,12 +1785,16 @@ Acceptance:
 
 ## 52. V1 Acceptance Matrix
 
+This is a product target matrix, not a claim that every future capability is implemented. Phase 6 acceptance is defined in section 0.6 and the canonical task spec; controller, scanner and UI remain deferred.
+
 | Requirement | V1 Acceptance |
 |---|---|
 | Standalone | No AI Manager dependency |
 | Quota strategy | Codex used only for implementation/fix |
-| Worker report | Captured automatically from final worker response |
-| Patch | Generated independently by Git |
+| Worker output | Captured; optional legacy report persistence, no required narrative file |
+| Normal source review | Exact GitHub candidate/spec; zero source/report/patch attachments |
+| Patch | Independent Git generation retained for local/legacy use |
+| GitHub publishing | Verified local SHA equals task-branch remote and optional PR HEAD |
 | Candidate | Exact committed SHA |
 | Baseline | Dirty baseline blocks start |
 | Post-worker state | Dirty candidate blocks review |
@@ -1698,7 +1810,7 @@ Acceptance:
 | Secret leakage | Upload blocked |
 | Fix loop | Max 3 by default |
 | Evidence loop | Max 5 by default |
-| Crash recovery | Resume without duplicate sends |
+| Crash recovery | Reconcile effects without duplicate sends; uncertain ownership pauses |
 | Storage | Portable user-selected root |
 | Temp cleanup | Automatic |
 | Completed task | Compact immediately |
@@ -1716,15 +1828,15 @@ The following are hard requirements and must not drift during implementation:
 3. **Relay has no AI model of its own.**
 4. **ChatGPT regular chat is the primary reviewer.**
 5. **Codex is used for code/fix, not routine review evidence retrieval.**
-6. **Worker report is captured from worker output by Relay.**
-7. **Canonical patch is generated by Git, not trusted from worker output.**
+6. **Worker output is untrusted narrative; implementation/audit reports are not normal deliverables.**
+7. **GitHub mirrors the verified local candidate; normal review requires no patch/report/source attachments. Legacy canonical patches come from Git.**
 8. **Candidate review is bound to exact BASE_SHA and HEAD_SHA.**
 9. **Dirty or mutable candidate states fail closed.**
-10. **NEED_EVIDENCE is fulfilled locally whenever possible.**
+10. **NEED_EVIDENCE supplies local/runtime verification; GitHub supplies normal source review. DSL compatibility remains.**
 11. **Reviewer cannot execute arbitrary shell commands.**
 12. **Same Codex worker session is reused when possible.**
 13. **Automatic loops are bounded.**
-14. **Secrets are scanned before upload.**
+14. **Secrets must be scanned before artifact upload. The broader scanner remains a deferred product requirement, not a Phase 6 implementation claim; credential transfer into configuration/ChatGPT is prohibited.**
 15. **Primary data lives in a portable user-selected data root.**
 16. **Disposable evidence is automatically garbage-collected.**
 17. **ReviewRelay never performs production deployment/release authority actions.**
@@ -1741,7 +1853,7 @@ Possible future work, explicitly deferred:
 - reviewer pooling;
 - Claude/Gemini reviewer adapters;
 - Claude Code worker adapter;
-- GitHub/GitLab PR integration;
+- general GitHub hosting features and GitLab PR integration beyond the approved task mirror;
 - CI server integration;
 - project-memory layer;
 - remote relay daemon;

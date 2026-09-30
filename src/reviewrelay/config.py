@@ -76,6 +76,33 @@ class StorageConfig:
 
 
 @dataclass(frozen=True)
+class GitHubConfig:
+    enabled: bool = False
+    remote: str = "origin"
+    base_branch: str = "main"
+    mode: str = "branch"
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.enabled, bool):
+            raise ConfigError("github.enabled must be boolean")
+        if not isinstance(self.remote, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}", self.remote):
+            raise ConfigError("github.remote must be a configured remote name")
+        validate_branch_name(self.base_branch)
+        if not isinstance(self.mode, str) or self.mode not in {"branch", "pr"}:
+            raise ConfigError("github.mode must be branch or pr")
+
+
+def validate_branch_name(value: str) -> str:
+    if (not isinstance(value, str) or len(value) > 200
+            or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._/-]*", value)
+            or any(token in value for token in ("..", "//", "@{"))
+            or any(part.startswith(".") or part.endswith((".", ".lock")) for part in value.split("/"))
+            or value.endswith("/")):
+        raise ConfigError("Invalid Git branch name")
+    return value
+
+
+@dataclass(frozen=True)
 class ProjectConfig:
     project_id: str
     repo: RepoConfig
@@ -85,6 +112,7 @@ class ProjectConfig:
     storage: StorageConfig = field(default_factory=StorageConfig)
     chatgpt: dict[str, Any] = field(default_factory=dict)
     worker: dict[str, Any] = field(default_factory=dict)
+    github: GitHubConfig = field(default_factory=GitHubConfig)
 
     @classmethod
     def from_yaml(cls, text: str) -> "ProjectConfig":
@@ -96,7 +124,7 @@ class ProjectConfig:
             raise ConfigError(f"Invalid project YAML: {exc}") from exc
         if not isinstance(raw, dict):
             raise ConfigError("Project YAML must contain a mapping at its root")
-        _keys(raw, {"project_id", "repo", "review", "tests", "security", "storage", "chatgpt", "worker"}, "root")
+        _keys(raw, {"project_id", "repo", "review", "tests", "security", "storage", "chatgpt", "worker", "github"}, "root")
 
         project_id = _required_string(raw, "project_id", "root")
         validate_identifier(project_id, "project_id")
@@ -174,7 +202,10 @@ class ProjectConfig:
 
         chatgpt = _mapping(raw.get("chatgpt", {}), "chatgpt")
         worker = _mapping(raw.get("worker", {}), "worker")
-        return cls(project_id, repo, review, tests, security, storage, chatgpt, worker)
+        github_raw = _mapping(raw.get("github", {}), "github")
+        _keys(github_raw, {"enabled", "remote", "base_branch", "mode"}, "github")
+        github = GitHubConfig(**github_raw)
+        return cls(project_id, repo, review, tests, security, storage, chatgpt, worker, github)
 
     @classmethod
     def load(cls, path: str | Path) -> "ProjectConfig":
@@ -220,6 +251,9 @@ class ProjectConfig:
             result["chatgpt"] = self.chatgpt
         if self.worker:
             result["worker"] = self.worker
+        if self.github.enabled or self.github != GitHubConfig():
+            result["github"] = {"enabled": self.github.enabled, "remote": self.github.remote,
+                                "base_branch": self.github.base_branch, "mode": self.github.mode}
         return result
 
 

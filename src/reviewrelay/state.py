@@ -11,7 +11,7 @@ from .models import TaskRecord, TaskState, utc_now_iso
 from .storage import PortableDataRoot
 
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 
 class StateStore:
@@ -36,8 +36,12 @@ class StateStore:
         elif version == 1:
             self._migrate_v1_to_v2()
             self._migrate_v2_to_v3()
+            self._migrate_v3_to_v4()
         elif version == 2:
             self._migrate_v2_to_v3()
+            self._migrate_v3_to_v4()
+        elif version == 3:
+            self._migrate_v3_to_v4()
         elif version != SCHEMA_VERSION:
             self._connection.close()
             raise SchemaVersionError(f"No migration path from database version {version}")
@@ -45,6 +49,7 @@ class StateStore:
     def _create_current_schema(self) -> None:
         allowed_states = ", ".join(f"'{state.value}'" for state in TaskState)
         with self._connection:
+            self._connection.execute("BEGIN IMMEDIATE")
             self._connection.execute(f"""
                 CREATE TABLE tasks (
                     project_id TEXT NOT NULL,
@@ -73,6 +78,7 @@ class StateStore:
             """)
             self._connection.execute("CREATE UNIQUE INDEX worker_thread_identity ON tasks(worker_thread_id) WHERE worker_thread_id IS NOT NULL")
             self._connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+            self._github_tables()
 
     def _migrate_v1_to_v2(self) -> None:
         """Add the two Phase 2 counters without rewriting Phase 1 task state."""
@@ -92,7 +98,29 @@ class StateStore:
                            "worker_last_turn_status", "worker_last_event_at"):
                 self._connection.execute(f"ALTER TABLE tasks ADD COLUMN {column} TEXT")
             self._connection.execute("CREATE UNIQUE INDEX worker_thread_identity ON tasks(worker_thread_id) WHERE worker_thread_id IS NOT NULL")
-            self._connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+            self._connection.execute("PRAGMA user_version = 3")
+
+    def _github_tables(self) -> None:
+        self._connection.execute("""CREATE TABLE github_publications (
+            project_id TEXT NOT NULL, task_id TEXT NOT NULL, github_remote TEXT NOT NULL,
+            github_base_branch TEXT NOT NULL, github_task_branch TEXT NOT NULL,
+            github_pr_url TEXT, github_pr_number INTEGER, github_last_local_sha TEXT,
+            github_last_remote_sha TEXT, github_publish_status TEXT NOT NULL,
+            github_published_at TEXT, metadata_json TEXT NOT NULL,
+            PRIMARY KEY(project_id, task_id))""")
+        self._connection.execute("""CREATE TABLE github_events (
+            sequence INTEGER PRIMARY KEY AUTOINCREMENT, project_id TEXT NOT NULL,
+            task_id TEXT NOT NULL, kind TEXT NOT NULL, payload_json TEXT NOT NULL, created_at TEXT NOT NULL)""")
+        self._connection.execute("""CREATE TABLE github_reviews (
+            review_key TEXT PRIMARY KEY, project_id TEXT NOT NULL, task_id TEXT NOT NULL,
+            candidate_sha TEXT NOT NULL, review_cycle INTEGER NOT NULL, status TEXT NOT NULL,
+            metadata_json TEXT NOT NULL, raw_text TEXT, decision_json TEXT, updated_at TEXT NOT NULL)""")
+
+    def _migrate_v3_to_v4(self) -> None:
+        with self._connection:
+            self._connection.execute("BEGIN IMMEDIATE")
+            self._github_tables()
+            self._connection.execute("PRAGMA user_version = 4")
 
     def save(self, record: TaskRecord) -> None:
         validate_identifier(record.project_id, "project_id")

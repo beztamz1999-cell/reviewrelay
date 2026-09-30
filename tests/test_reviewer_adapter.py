@@ -39,9 +39,15 @@ FIXTURE = Path(__file__).parent / "fixtures" / "chatgpt_ui.html"
 class _FixtureHandler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:
         mode = parse_qs(urlsplit(self.path).query).get("mode", [""])[0]
-        if mode == "nav-error":
-            self.send_response(503)
+        if mode in ("nav-error", "login-error"):
+            self.send_response(403 if mode == "login-error" else 503)
+            if mode == "login-error":
+                body = b'<html><body><button>Log in</button></body></html>'
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
             self.end_headers()
+            if mode == "login-error":
+                self.wfile.write(body)
             return
         body = FIXTURE.read_bytes()
         self.send_response(200)
@@ -162,6 +168,19 @@ def test_navigation_login_and_conversation_readiness(fixture_server, tmp_path):
                 await failed.open_task_conversation()
         finally:
             await failed.close()
+
+    _run(run())
+
+
+def test_http_error_with_login_ui_returns_login_required(fixture_server, tmp_path):
+    async def run():
+        adapter = ChatGPTWebAdapter(tmp_path / "login-error", _settings(fixture_server, "login-error"))
+        try:
+            with pytest.raises(LoginRequired) as caught:
+                await adapter.open_task_conversation()
+            assert caught.value.code == "LOGIN_REQUIRED"
+        finally:
+            await adapter.close()
 
     _run(run())
 

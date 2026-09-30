@@ -64,10 +64,12 @@ chatgpt:
 To explicitly run the harmless live transport smoke (opens the configured conversation, creates and attaches a generated text file, and sends one marker request):
 
 ```powershell
-python -m reviewrelay.dev.chatgpt_smoke --data-root "G:\REVIEW_RELAY_DATA" --conversation-url "https://chatgpt.com/c/your-existing-conversation" --send
+python -m reviewrelay.dev.chatgpt_smoke --data-root "G:\REVIEW_RELAY_DATA" --browser-profile reviewer-chrome --conversation-url "https://chatgpt.com/c/your-existing-conversation" --send
 ```
 
-The first login may require the Owner to sign in manually in the opened persistent browser. The smoke prints the raw response and performs no Codex action. Do not run it in CI or as part of the automated suite.
+The live smoke takes an exclusive ReviewRelay profile lock and uses the installed Google Chrome executable with a dedicated profile at `<DATA_ROOT>/browser-profile/<browser-profile>`. It first launches **Auth Mode** as normal Chrome with no Playwright or CDP. The Owner signs in manually, confirms the existing conversation is visible, and closes that Chrome window. Only after the Auth Mode process exits does ReviewRelay relaunch Chrome with the exact same profile in **Automation Mode**, enable an ephemeral remote-debugging port bound to `127.0.0.1`, and attach Playwright over CDP. If authentication is no longer valid after relaunch, the smoke stops with `LOGIN_REQUIRED`; it never attempts login in Automation Mode. ReviewRelay never opens the Owner's default Chrome profile and does not export, import, read, or inject cookies or credentials. Offline adapter fixtures continue to use Playwright's bundled Chromium backend.
+
+The smoke prints the raw response and requires the new owned response to contain `REVIEWRELAY_SMOKE_OK`; it performs no Codex action. Do not run it in CI or as part of the automated suite.
 
 ## Deferred scope
 

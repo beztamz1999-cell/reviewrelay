@@ -15,6 +15,7 @@ import logging
 import math
 from pathlib import Path
 import re
+import subprocess
 from typing import Any, Sequence
 from urllib.parse import urlsplit
 
@@ -26,10 +27,20 @@ from .base import (
     MAX_SINGLE_ATTACHMENT_BYTES,
     MAX_TOTAL_ATTACHMENT_BYTES,
     AssistantResponse,
+    BrowserBackend,
     ChatGPTWebSettings,
     SendDisposition,
     SendResult,
     TurnBaseline,
+)
+from .chrome_cdp import (
+    BrowserProfileInUseError,
+    ChromeMode,
+    ReviewRelayProfileLock,
+    find_google_chrome,
+    launch_chrome,
+    read_chrome_cdp_endpoint,
+    request_chrome_shutdown,
 )
 from .errors import (
     AmbiguousResponse,
@@ -83,6 +94,7 @@ class ChatGPTWebAdapter:
         project_id: str | None = None,
         task_id: str | None = None,
         selectors: ChatGPTSelectors | None = None,
+        profile_lock: ReviewRelayProfileLock | None = None,
     ) -> None:
         self.data_root = data_root if isinstance(data_root, PortableDataRoot) else PortableDataRoot(data_root)
         self.settings = settings or ChatGPTWebSettings()
@@ -97,10 +109,17 @@ class ChatGPTWebAdapter:
         self.project_id = project_id
         self.task_id = task_id
         self.selectors = selectors or ChatGPTSelectors()
+        self._provided_profile_lock = profile_lock
+        self._profile_lock: ReviewRelayProfileLock | None = None
+        self._owns_profile_lock = False
         self.profile_path: Path | None = None
         self._playwright: Any = None
+        self._browser: Any = None
         self._context: Any = None
         self._page: Any = None
+        self._chrome_process: subprocess.Popen[bytes] | None = None
+        self._cdp_endpoint: str | None = None
+        self._start_lock = asyncio.Lock()
         self._navigation_generation = 0
         self._active_conversation_url: str | None = None
         self._send_registry: OrderedDict[str, tuple[str, SendResult]] = OrderedDict()
@@ -113,45 +132,74 @@ class ChatGPTWebAdapter:
             raise BrowserStartFailed("Browser adapter has not been started")
         return self._page
 
-    async def start(self) -> Path:
-        """Launch one persistent Chromium profile beneath the portable data root."""
-        if self._context is not None:
-            return self.profile_path  # type: ignore[return-value]
+    @property
+    def browser_version(self) -> str | None:
+        if self._browser is None:
+            return None
         try:
-            self.data_root.create()
-            profile = self.data_root.safe_path(Path("browser-profile") / self.settings.browser_profile)
-            self.data_root.assert_managed_path(profile)
-            profile.mkdir(parents=True, exist_ok=True)
-            self.profile_path = self.data_root.assert_managed_path(profile.resolve(strict=True))
-            from playwright.async_api import async_playwright
+            return str(self._browser.version)
+        except Exception:
+            return None
 
-            self._playwright = await async_playwright().start()
-            self._context = await self._playwright.chromium.launch_persistent_context(
-                user_data_dir=str(self.profile_path),
-                headless=self.settings.headless,
-                timeout=self.settings.timeouts.navigation_seconds * 1000,
-            )
-            self._page = self._context.pages[0] if self._context.pages else await self._context.new_page()
-            self._page.on("framenavigated", self._on_frame_navigated)
-            return self.profile_path
-        except Exception as exc:
-            await self._stop_partial_browser()
-            raise BrowserStartFailed(f"Could not launch persistent Chromium profile: {type(exc).__name__}") from exc
+    async def start(self) -> Path:
+        """Start or reconnect to the selected browser with a managed profile."""
+        async with self._start_lock:
+            if self._context is not None:
+                if self.settings.browser_backend is BrowserBackend.PLAYWRIGHT_CHROMIUM or self._browser_is_connected():
+                    return self.profile_path  # type: ignore[return-value]
+                self._context = None
+                self._page = None
+                self._browser = None
+            try:
+                self.data_root.create()
+                profile = self.data_root.safe_path(Path("browser-profile") / self.settings.browser_profile)
+                self.data_root.assert_managed_path(profile)
+                profile.mkdir(parents=True, exist_ok=True)
+                self.profile_path = self.data_root.assert_managed_path(profile.resolve(strict=True))
+                if self.settings.browser_backend is BrowserBackend.GOOGLE_CHROME_CDP:
+                    self._ensure_chrome_profile_lock()
+                if self._playwright is None:
+                    from playwright.async_api import async_playwright
+
+                    self._playwright = await async_playwright().start()
+
+                if self.settings.browser_backend is BrowserBackend.PLAYWRIGHT_CHROMIUM:
+                    self._context = await self._playwright.chromium.launch_persistent_context(
+                        user_data_dir=str(self.profile_path),
+                        headless=self.settings.headless,
+                        timeout=self.settings.timeouts.navigation_seconds * 1000,
+                    )
+                else:
+                    await self._start_or_reconnect_chrome()
+                    contexts = self._browser.contexts if self._browser is not None else []
+                    if not contexts:
+                        raise BrowserStartFailed("ReviewRelay Chrome has no attachable browser context")
+                    self._context = contexts[0]
+
+                self._page = self._context.pages[0] if self._context.pages else await self._context.new_page()
+                self._page.on("framenavigated", self._on_frame_navigated)
+                return self.profile_path
+            except BaseException as exc:
+                await self._stop_partial_browser()
+                if isinstance(exc, BrowserStartFailed):
+                    raise
+                if not isinstance(exc, Exception):
+                    raise
+                backend = self.settings.browser_backend.value
+                raise BrowserStartFailed(f"Could not start {backend} browser: {type(exc).__name__}") from exc
 
     async def close(self) -> None:
-        context, self._context = self._context, None
-        playwright, self._playwright = self._playwright, None
-        self._page = None
-        if context is not None:
+        cleanup = asyncio.create_task(self._close_browser_resources())
+        try:
+            await asyncio.shield(cleanup)
+        except asyncio.CancelledError:
+            task = asyncio.current_task()
+            if task is not None:
+                task.uncancel()
             try:
-                await context.close()
-            except Exception as exc:
-                _LOG.debug("Browser context close failed: %s", type(exc).__name__)
-        if playwright is not None:
-            try:
-                await playwright.stop()
-            except Exception as exc:
-                _LOG.debug("Playwright shutdown failed: %s", type(exc).__name__)
+                await cleanup
+            finally:
+                raise
 
     async def __aenter__(self) -> "ChatGPTWebAdapter":
         await self.start()
@@ -161,19 +209,153 @@ class ChatGPTWebAdapter:
         await self.close()
 
     async def _stop_partial_browser(self) -> None:
+        await self._close_browser_resources()
+
+    async def _close_browser_resources(self) -> None:
         context, self._context = self._context, None
+        browser, self._browser = self._browser, None
         playwright, self._playwright = self._playwright, None
+        process = self._chrome_process
+        self._cdp_endpoint = None
         self._page = None
-        if context is not None:
+        if self.settings.browser_backend is BrowserBackend.GOOGLE_CHROME_CDP:
+            if context is not None:
+                try:
+                    pages = list(context.pages)
+                except Exception:
+                    pages = []
+                for page in pages:
+                    try:
+                        await page.close()
+                    except Exception as exc:
+                        _LOG.debug("ReviewRelay Chrome page close failed: %s", type(exc).__name__)
+            if browser is not None:
+                try:
+                    # A CDP-connected Browser.close() disconnects Playwright; it does not own Chrome.
+                    await browser.close()
+                except Exception as exc:
+                    _LOG.debug("ReviewRelay Chrome CDP disconnect failed: %s", type(exc).__name__)
+        elif context is not None:
             try:
                 await context.close()
-            except Exception:
-                pass
+            except Exception as exc:
+                _LOG.debug("Browser context close failed: %s", type(exc).__name__)
         if playwright is not None:
             try:
                 await playwright.stop()
-            except Exception:
+            except Exception as exc:
+                _LOG.debug("Playwright shutdown failed: %s", type(exc).__name__)
+        if process is not None:
+            await self._stop_chrome_process(process)
+            if process.poll() is not None:
+                self._chrome_process = None
+        profile_lock = self._profile_lock
+        if profile_lock is not None and self._owns_profile_lock:
+            if process is None or process.poll() is not None:
+                profile_lock.release()
+                self._profile_lock = None
+                self._owns_profile_lock = False
+            else:
+                # Keep the lock in this adapter if Chrome did not exit; fail closed for reuse.
+                self._profile_lock = profile_lock
+                _LOG.warning("ReviewRelay profile lock retained because its Chrome process is still running")
+
+    def _ensure_chrome_profile_lock(self) -> None:
+        if self._profile_lock is not None and self._profile_lock.acquired:
+            return
+        if self.profile_path is None:
+            raise BrowserStartFailed("ReviewRelay Chrome profile is not ready")
+        if self._provided_profile_lock is not None:
+            if (
+                not self._provided_profile_lock.acquired
+                or not self._provided_profile_lock.matches_profile(self.profile_path)
+            ):
+                raise BrowserStartFailed("The supplied ReviewRelay profile lock is missing or belongs to another profile")
+            self._profile_lock = self._provided_profile_lock
+            self._owns_profile_lock = False
+            return
+        lock = ReviewRelayProfileLock(self.data_root, self.settings.browser_profile)
+        try:
+            lock.acquire()
+        except BrowserProfileInUseError as exc:
+            raise BrowserStartFailed(str(exc)) from exc
+        self._profile_lock = lock
+        self._owns_profile_lock = True
+
+    def _browser_is_connected(self) -> bool:
+        if self._browser is None:
+            return False
+        try:
+            return bool(self._browser.is_connected())
+        except Exception:
+            return False
+
+    async def _start_or_reconnect_chrome(self) -> None:
+        if self.profile_path is None or self._playwright is None:
+            raise BrowserStartFailed("ReviewRelay Chrome profile is not ready")
+
+        if self._chrome_process is None or self._chrome_process.poll() is not None:
+            self._chrome_process = None
+            self._cdp_endpoint = None
+            active_port = self.profile_path / "DevToolsActivePort"
+            self.data_root.assert_managed_path(active_port)
+            active_port.unlink(missing_ok=True)
+            try:
+                self._chrome_process = launch_chrome(
+                    find_google_chrome(),
+                    self.profile_path,
+                    mode=ChromeMode.AUTOMATION,
+                )
+            except Exception as exc:
+                raise BrowserStartFailed(f"Could not launch the installed Google Chrome browser: {type(exc).__name__}") from exc
+
+        deadline = asyncio.get_running_loop().time() + self.settings.timeouts.navigation_seconds
+        last_error: Exception | None = None
+        while asyncio.get_running_loop().time() < deadline:
+            if self._chrome_process is None or self._chrome_process.poll() is not None:
+                raise BrowserStartFailed("ReviewRelay Google Chrome exited before its localhost CDP endpoint was ready")
+            endpoint = read_chrome_cdp_endpoint(self.profile_path)
+            if endpoint is not None:
+                remaining_ms = max(1, int((deadline - asyncio.get_running_loop().time()) * 1000))
+                try:
+                    browser = await self._playwright.chromium.connect_over_cdp(
+                        endpoint,
+                        timeout=min(1000, remaining_ms),
+                    )
+                    if not browser.contexts:
+                        await browser.close()
+                        raise BrowserStartFailed("ReviewRelay Google Chrome exposed no default browser context")
+                    self._browser = browser
+                    self._cdp_endpoint = endpoint
+                    return
+                except BrowserStartFailed:
+                    raise
+                except Exception as exc:
+                    last_error = exc
+            await asyncio.sleep(0.1)
+        raise BrowserStartFailed("ReviewRelay Google Chrome did not expose a usable localhost CDP endpoint") from last_error
+
+    @staticmethod
+    async def _stop_chrome_process(process: subprocess.Popen[bytes]) -> None:
+        if process.poll() is not None:
+            return
+        if await request_chrome_shutdown(process, timeout_seconds=3):
+            return
+        if process.poll() is None:
+            try:
+                process.terminate()
+                await asyncio.to_thread(process.wait, timeout=3)
+                return
+            except subprocess.TimeoutExpired:
                 pass
+            except OSError as exc:
+                _LOG.debug("ReviewRelay Chrome graceful stop failed: %s", type(exc).__name__)
+        if process.poll() is None:
+            try:
+                process.kill()
+                await asyncio.to_thread(process.wait, timeout=3)
+            except (OSError, subprocess.TimeoutExpired) as exc:
+                _LOG.warning("ReviewRelay Chrome process did not stop cleanly: %s", type(exc).__name__)
 
     def _on_frame_navigated(self, frame: Any) -> None:
         try:
@@ -194,9 +376,11 @@ class ChatGPTWebAdapter:
                     wait_until="domcontentloaded",
                     timeout=self.settings.timeouts.navigation_seconds * 1000,
                 )
+                # Authentication UI takes precedence over the navigation status:
+                # expired sessions can render a login page with a 4xx response.
+                await self._raise_if_login_required()
                 if response is not None and response.status >= 400:
                     raise ConversationNavigationFailed(f"Conversation navigation returned HTTP {response.status}")
-                await self._raise_if_login_required()
                 if not self._same_conversation(self.page.url, target):
                     await self._raise_if_login_required()
                     raise ConversationNavigationFailed("Browser did not remain on the configured conversation")

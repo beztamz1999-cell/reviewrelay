@@ -53,12 +53,20 @@ class ChatGPTTimeouts:
         )
 
 
+class BrowserBackend(str, Enum):
+    """Browser engine used by the web adapter."""
+
+    PLAYWRIGHT_CHROMIUM = "playwright-chromium"
+    GOOGLE_CHROME_CDP = "google-chrome-cdp"
+
+
 @dataclass(frozen=True)
 class ChatGPTWebSettings:
     base_url: str = DEFAULT_CHATGPT_BASE_URL
     browser_profile: str = "default"
     conversation_url: str | None = None
     headless: bool = False
+    browser_backend: BrowserBackend = BrowserBackend.PLAYWRIGHT_CHROMIUM
     timeouts: ChatGPTTimeouts = field(default_factory=ChatGPTTimeouts)
 
     def __post_init__(self) -> None:
@@ -69,6 +77,13 @@ class ChatGPTWebSettings:
             raise ReviewerConfigurationError(str(exc)) from exc
         if not isinstance(self.headless, bool):
             raise ReviewerConfigurationError("chatgpt.headless must be a boolean")
+        try:
+            backend = BrowserBackend(self.browser_backend)
+        except (TypeError, ValueError) as exc:
+            raise ReviewerConfigurationError("chatgpt.browser_backend must be a supported browser backend") from exc
+        object.__setattr__(self, "browser_backend", backend)
+        if backend is BrowserBackend.GOOGLE_CHROME_CDP and self.headless:
+            raise ReviewerConfigurationError("google-chrome-cdp requires a visible browser for Owner authentication")
         if not isinstance(self.timeouts, ChatGPTTimeouts):
             raise ReviewerConfigurationError("chatgpt.timeouts must be ChatGPTTimeouts")
         if self.conversation_url is not None:
@@ -80,7 +95,7 @@ class ChatGPTWebSettings:
             return cls()
         if not isinstance(value, Mapping) or any(not isinstance(key, str) for key in value):
             raise ReviewerConfigurationError("chatgpt configuration must be a mapping")
-        allowed = {"base_url", "browser_profile", "conversation_url", "headless", "timeouts"}
+        allowed = {"base_url", "browser_profile", "conversation_url", "headless", "browser_backend", "timeouts"}
         extra = set(value) - allowed
         if extra:
             raise ReviewerConfigurationError("Unknown ChatGPT web setting(s): " + ", ".join(sorted(extra)))
@@ -92,6 +107,7 @@ class ChatGPTWebSettings:
             browser_profile=value.get("browser_profile", "default"),
             conversation_url=conversation_url,
             headless=value.get("headless", False),
+            browser_backend=value.get("browser_backend", BrowserBackend.PLAYWRIGHT_CHROMIUM),
             timeouts=ChatGPTTimeouts.from_mapping(value.get("timeouts")),
         )
         return settings

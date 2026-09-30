@@ -2,6 +2,7 @@
 
 from .base import (
     AssistantResponse,
+    BrowserBackend,
     ChatGPTTimeouts,
     ChatGPTWebSettings,
     ReviewerAdapter,
@@ -34,7 +35,7 @@ from .errors import (
 __all__ = [
     "AmbiguousResponse", "AssistantResponse", "AttachmentLimitExceeded", "AttachmentNotAllowed",
     "AttachmentNotFound", "AttachmentUploadFailed", "BrowserStartFailed", "ChatGPTTimeouts",
-    "ChatGPTWebAdapter", "ChatGPTWebSettings", "ComposerNotFound", "ConversationNavigationFailed",
+    "BrowserBackend", "ChatGPTWebAdapter", "ChatGPTWebSettings", "ComposerNotFound", "ConversationNavigationFailed",
     "ConversationNotReady", "LoginRequired", "MessageSendAmbiguous", "MessageSendFailed",
     "ResponseExtractionFailed", "ResponseTimeout", "ReviewKeyConflict", "ReviewerAdapter",
     "ReviewerAdapterError", "ReviewerConfigurationError", "ReviewerConversationChanged",

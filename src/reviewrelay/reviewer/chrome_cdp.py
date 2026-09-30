@@ -152,7 +152,13 @@ def build_chrome_launch_command(
         "--no-default-browser-check",
     ]
     if mode is ChromeMode.AUTOMATION:
-        command.extend(("--remote-debugging-address=127.0.0.1", "--remote-debugging-port=0", "about:blank"))
+        command.extend(
+            (
+                "--remote-debugging-address=127.0.0.1",
+                "--remote-debugging-port=0",
+                "--restore-last-session",
+            )
+        )
     else:
         command.append(conversation_url or "")
     return command

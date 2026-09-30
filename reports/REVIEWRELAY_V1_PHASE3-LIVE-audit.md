@@ -7,115 +7,117 @@ BASE_SHA=bdcfcfe458e42d0eba315861af4524d51c500efc
 BRANCH=main
 INITIAL_WORKTREE_CLEAN=YES
 IMPLEMENTATION_COMMIT_SHA=68a180233956bafc902d423c56a647b24ae201dd
+PRE_FINALIZATION_HEAD_SHA=11466ec5a6aaadea4d03b89b4dfafc1a74c0e9de
+PRE_FINALIZATION_WORKTREE_STATUS=PHASE3_CHANGES_PENDING_COMMIT
 ```
 
-The requested reviewer conversation was `https://chatgpt.com/c/6abc2ec9-1848-83ec-b1cd-a105f0941738`. No other conversation URL was used. Phase 4 was not started.
+The only configured reviewer conversation used in this task was `https://chatgpt.com/c/6abc2ec9-1848-83ec-b1cd-a105f0941738`. No other conversation URL was opened. Phase 4 was not started.
 
-## Live environment
+## Live environment and authentication safeguards
 
 ```text
 OS=Windows 11 Pro (build 26200)
 PYTHON=3.13.15
 PLAYWRIGHT=1.63.0
 GOOGLE_CHROME=154.0.8037.92
-CHATGPT_ORIGIN=https://chatgpt.com
-HEADFUL=YES
-PROFILE=browser-profile/reviewer-chrome (beneath the configured portable data root)
+PROFILE=browser-profile/reviewer-chrome under the portable data root
 CDP_BIND=127.0.0.1; ephemeral port
 ```
 
-The installed Google Chrome ran with a dedicated ReviewRelay `--user-data-dir`. Auth Mode had no Playwright or remote-debugging flags. The Owner reported completing sign-in and closing Auth Mode Chrome; the process was confirmed closed before Automation Mode began. Automation Mode relaunched the same profile, enabled CDP only on `127.0.0.1`, and Playwright attached to it. No default Chrome profile was selected. No cookie, token, or credential material was read, transferred, or injected.
+Google rejected Playwright-managed Chromium with “This browser or app may not be secure.” The adopted two-mode bootstrap uses installed Google Chrome and a dedicated ReviewRelay `--user-data-dir`. Auth Mode has no CDP or Playwright; the Owner signs in and opens the configured conversation manually. Automation Mode relaunches the same dedicated profile with CDP bound to localhost, then Playwright attaches. The Owner's default Chrome profile is never used. A profile lock prevents Auth and Automation modes from overlapping. No credentials, cookies, or tokens were automated, read, exported, injected, or copied.
 
-## Authentication incompatibility and adopted bootstrap
+## Exact-conversation access matrix (2026-09-30)
 
-The initial Playwright-managed Chromium live attempt reached Google authentication, which rejected that browser with “This browser or app may not be secure.” No bypass or credential automation was attempted. Phase 3 live startup now supports the two-mode installed-Chrome flow: normal Chrome for manual Owner authentication, then a separate Automation Mode launch of the same dedicated profile with localhost-only CDP. A cross-process profile lock prevents the two ReviewRelay modes from overlapping. Playwright Chromium remains the offline fixture backend.
-
-A later Windows cleanup run exposed that Ctrl-Break is provided by Python's `signal` module on this host, not `subprocess`; Chrome cleanup now uses the supported signal and the Automation Mode process exited. Profile-process inspection after the final live attempt found zero Chrome processes using the ReviewRelay profile.
-
-## Live acceptance result
-
-The authenticated-profile Automation Mode attached successfully and reported Chrome 154.0.8037.92. Navigation to the one configured reviewer conversation returned HTTP 403 on both the first post-authentication run and the final Automation-only retry. The page did not expose a detected ChatGPT login control, so the evidence does not establish whether this is an expired session or conversation access denial. The adapter fails closed with `CONVERSATION_NAVIGATION_FAILED`; it does not mislabel an unrecognized 403 as `LOGIN_REQUIRED`.
-
-Both attempts stopped before the send boundary. The harmless generated `relay-smoke.txt` was the only attachment prepared. No smoke prompt was submitted and no response was captured.
+The same configured URL and dedicated profile were used throughout. The earlier B observation that reported `FAIL` was invalid: Chrome had opened `about:blank`, and the Owner had not yet entered the URL. That result is superseded by the corrected matrix below.
 
 ```text
-AUTH_MODE_OWNER_REPORTED_SIGN_IN=YES
-AUTH_MODE_CHROME_CLOSED=YES
-AUTOMATION_MODE_CDP_ATTACH=YES
-CONFIGURED_CONVERSATION_HTTP_STATUS=403
-LOGIN_REQUIRED_UI_DETECTED=NO
-MESSAGE_SENT_ONCE=NO
-OWNED_RESPONSE_DETECTED=NOT_REACHED
-RESPONSE_COMPLETION=NOT_REACHED
-RAW_RESPONSE_CAPTURED=NOT_REACHED
-EXPECTED_MARKER_FOUND=NOT_REACHED
-PHASE3_LIVE_CHATGPT_SMOKE=FAIL
+NORMAL_CHROME_CONVERSATION_ACCESS=PASS
+CDP_ONLY_CONVERSATION_ACCESS=PASS
+CDP_PLAYWRIGHT_EXISTING_TAB_ACCESS=PASS
+RESTORED_TAB_AFTER_CLEAN_CHROME_EXIT=PASS
+RESTORED_TAB_COMPOSER_READY=PASS
+DIRECT_PAGE_GOTO_HTTP_STATUS=403 (PRIOR LIVE RUNS; SAME EXACT URL)
+DIRECT_NAVIGATION_RETRIED_AFTER_MATRIX=NO
 ```
 
-No selector change was justified: ChatGPT rejected navigation before the adapter could establish a usable conversation/composer. The minimum transport correction checks for explicit login UI before classifying a 4xx response, so an expired session that renders a login page returns `LOGIN_REQUIRED`. Regression coverage exercises that 403-plus-login-page case. An unrecognized 403 remains a typed navigation failure; no alternate conversation, private endpoint, or authentication workaround was attempted.
+For A, the Owner manually opened the exact conversation in installed Chrome Auth Mode and confirmed that the conversation and composer worked, then exited Chrome cleanly. For B, the Owner manually entered the exact URL in installed Chrome Automation Mode with loopback CDP enabled and Playwright detached, and confirmed the conversation and composer worked. The Owner left that window open for C. The HTTP status for B was not captured.
+
+For C, Playwright attached to the already-open CDP browser. It found one tab whose URL matched the exact configured conversation. On that existing tab, the `Ask ChatGPT` textbox was visible, enabled, and editable. No navigation was performed. After the Owner cleanly exited Chrome, Automation Mode was launched again with session restore enabled. The exact reviewer tab returned in the same dedicated profile; Playwright attached and again verified the composer without navigating. These checks read no message text and sent no prompt.
+
+Prior live attempts using `page.goto(exact_conversation_url)` returned HTTP 403. Combined with A, B, C, and the restored-tab observation, the failure is localized to programmatic direct navigation, not to the account/session, CDP startup, or Playwright attachment to an existing tab. The prior 403 evidence was not reproduced after the matrix; no repeat request was made.
+
+## Production transport change
+
+The installed-Chrome live backend now searches the attached context for exactly one already-restored tab matching the configured conversation URL. It selects that tab, checks explicit login UI and the editable composer, and fails closed if the exact tab is missing, ambiguous, unauthenticated, or not ready. It never calls `page.goto()` in the live CDP path. Offline Playwright Chromium keeps its deterministic fixture navigation path. The centralized composer selector catalog now recognizes the live `Ask ChatGPT` accessible name.
+
+Automation Mode launch includes `--restore-last-session`; the Owner opens the exact conversation during Auth Mode and exits Chrome normally so the dedicated profile restores it. CDP remains bound only to `127.0.0.1`. Auth Mode and Automation Mode cannot hold the profile concurrently.
+
+Live UI inspection found that `Add files and more` is initially disabled during page startup, then opens several file inputs, including the exact local-upload input labelled `Attach files`. The adapter waits a bounded time for that control to become enabled, waits for the matching input to be attached, and excludes the photo/video and library inputs. In Chrome live mode, it confirms the exact selected local filenames at the file-input change event and verifies composer attachment-chip/progress counts before sending; historical message attachments are excluded. Offline fixture mode retains deterministic filename checks. CDP shutdown asks Chrome to close gracefully without closing the restored tab first, preserving session restoration.
+
+Further live inspection found that the visually empty `Ask ChatGPT` contenteditable returns one whitespace character from `inner_text`. The previous truthiness check incorrectly classified this as an Owner draft. The guard now treats whitespace-only composer text as empty while still preserving non-whitespace drafts. The offline regression fixture now covers that live behavior; the existing non-empty draft regression still fails closed. A metadata-only live diagnostic recorded the selected textbox label/type and text lengths, without displaying or logging draft content.
+
+The live composer renders each prompt line in separate paragraph elements; `inner_text` adds presentation newlines around those blocks. Composer reads now reconstruct the direct paragraph blocks and retain the intended line breaks, so the exact prompt is checked before send. Live attachment readiness now verifies the selected input file names at the change event and uses the visible composer chip/progress counts. This accounts for the current live UI's generic Remove accessibility label without accepting pre-existing chips or count mismatches.
+
+The live conversation UI no longer exposes `[data-message-author-role]` on its visible turns. The centralized turn selectors now recognize the observed user bubble class and assistant Markdown container. A regression fixture with that live markup verifies exact user-turn ownership, a new assistant response, completion, and attachment handling.
+
+## Live smoke status
+
+Twelve smoke command executions reached the exact configured URL. The first eleven stopped before the Send click while live-only UI differences were diagnosed and fixed: asynchronous attachment controls, attachment display labels, restored-draft hydration, whitespace-only empty composer text, paragraph-based composer reads, and current live turn markup. The twelfth execution selected only the generated smoke file, filled the exact harmless prompt, and clicked Send once. The CLI then timed out while looking for the user turn because its selectors still expected the old `data-message-author-role` markup; the send result was therefore marked ambiguous by that run. No second send was attempted.
+
+Read-only reconciliation on the same exact existing conversation found exactly one user bubble whose text matched the smoke prompt and exactly one assistant response after that bubble containing the expected marker. That response was stable across consecutive observations, no Stop control was visible, and raw response extraction returned `REVIEWRELAY_SMOKE_OK`. After the turn-selector fix and full regression, a second read-only reconciliation through the new centralized selectors confirmed the same result. No duplicate prompt was sent after the fix.
+
+```text
+SMOKE_EXECUTIONS=12
+PRE_SEND_ABORTED_EXECUTIONS=11
+SEND_CLICK_COUNT=1
+MESSAGE_SENT_ONCE=YES (CONFIRMED BY ONE EXACT USER PROMPT IN THE CONFIGURED CONVERSATION)
+CLI_SEND_RESULT=AMBIGUOUS_DUE_STALE_TURN_SELECTORS; RECONCILED_READ_ONLY
+OWNED_RESPONSE_DETECTED=YES (UNIQUE EXACT PROMPT FOLLOWED BY ONE MARKER RESPONSE)
+RESPONSE_COMPLETION=YES (STABLE; NO VISIBLE STOP CONTROL)
+RAW_RESPONSE_CAPTURED=YES
+RAW_RESPONSE=REVIEWRELAY_SMOKE_OK
+EXPECTED_MARKER_FOUND=YES
+POST_SELECTOR_FIX_SECOND_SEND=NO (EXISTING MESSAGE RECONCILED READ_ONLY)
+POST_SELECTOR_FIX_READ_ONLY_RECONCILIATION=PASS
+PHASE3_LIVE_CHATGPT_SMOKE=PASS
+```
 
 ## Regression evidence
 
-Commands run on the final implementation before this report was written:
-
-- `python -m pytest -q` — **267 passed in 28.78s**.
-- `python -m compileall -q src tests` — passed.
-- `git diff --check` — passed.
-
-Coverage includes offline Playwright Chromium, backend selection, Auth/Automation Chrome command construction, same-profile mode locking, localhost CDP endpoint parsing, Windows Ctrl-Break cleanup, explicit login UI on an HTTP 403 response, and prior Phase 1–3 regressions.
-
-Live commands used the exact configured URL above. The final retry was:
-
 ```text
-python -m reviewrelay.dev.chatgpt_smoke --data-root G:\REVIEW_RELAY_DATA --conversation-url https://chatgpt.com/c/6abc2ec9-1848-83ec-b1cd-a105f0941738 --automation-only --send
+python -m pytest -q                         PASS (276 passed)
+python -m compileall -q src tests            PASS
+git diff --check                             PASS
 ```
 
-It exited before message preparation because conversation navigation returned HTTP 403. The explicit `--send` flag authorizes only the one harmless smoke message if and when the page is usable; it did not result in a submission on these runs.
+The suite includes prior Phase 1–3 coverage, backend selection, Chrome launch command construction, profile-lock exclusion, loopback CDP endpoint parsing, explicit login handling, live `Ask ChatGPT` and `Add files and more` labels, delayed button/input readiness, opaque live attachment selection/chip-count and progress completion, Chrome session-preserving shutdown, exact existing-tab selection with no navigation, modern live user/assistant turn selectors, and fail-closed behavior when the configured tab is absent.
 
 ## Acceptance matrix
 
 | Gate | Result | Evidence |
 |---|---|---|
-| `PHASE3_LIVE_AUTH_MODE_MANUAL` | PASS | Owner reported sign-in; normal Auth Mode Chrome was closed before Automation Mode. |
-| `PHASE3_LIVE_DEDICATED_PROFILE` | PASS | Same managed ReviewRelay profile path used in both modes; no default profile. |
-| `PHASE3_LIVE_PROFILE_LOCK` | PASS | Cross-process lock test passed; Auth and Automation cannot acquire the same ReviewRelay lock concurrently. |
-| `PHASE3_LIVE_CDP_LOOPBACK` | PASS | Chrome command binds to `127.0.0.1`; adapter endpoint is built from the ephemeral port as a loopback URL. |
-| `PHASE3_LIVE_AUTOMATION_ATTACH` | PASS | Playwright attached to installed Chrome 154.0.8037.92 using the dedicated profile. |
-| `PHASE3_LIVE_LOGIN_REQUIRED_FLOW` | PASS (fixture) | Explicit login UI on HTTP 403 returns `LOGIN_REQUIRED`; live page did not expose a recognized login signal. |
-| `PHASE3_LIVE_CONVERSATION_NAVIGATION` | FAIL | Exact configured conversation returned HTTP 403 twice. |
-| `PHASE3_LIVE_SINGLE_SEND` | NOT_REACHED | No usable conversation; zero prompts submitted. |
-| `PHASE3_LIVE_OWNED_RESPONSE` | NOT_REACHED | No response was generated. |
-| `PHASE3_LIVE_RESPONSE_COMPLETION` | NOT_REACHED | No response was generated. |
-| `PHASE3_LIVE_RAW_EXTRACTION` | NOT_REACHED | No response was generated. |
-| `PHASE3_LIVE_SMOKE_MARKER` | NOT_REACHED | No response was generated. |
-| `PHASE1_REGRESSION` | PASS | Full suite: 267 passed. |
-| `PHASE2_REGRESSION` | PASS | Full suite: 267 passed. |
-| `PHASE3_OFFLINE_REGRESSION` | PASS | Full suite: 267 passed. |
+| `PHASE3_LIVE_AUTH_MODE_MANUAL` | PASS | Owner signed in and opened the exact conversation in normal installed Chrome. |
+| `PHASE3_LIVE_DEDICATED_PROFILE` | PASS | Auth and Automation used the same managed ReviewRelay profile, never the default profile. |
+| `PHASE3_LIVE_PROFILE_LOCK` | PASS | Existing cross-process lock prevents overlapping modes; full regression passes. |
+| `PHASE3_LIVE_CDP_LOOPBACK` | PASS | Chrome command and live endpoint use `127.0.0.1`. |
+| `PHASE3_LIVE_AUTOMATION_ATTACH` | PASS | Playwright attached to installed Chrome through CDP. |
+| `PHASE3_LIVE_CONVERSATION_MATRIX` | PASS | A, B, C, and clean-exit session restoration all passed for the exact URL. |
+| `PHASE3_LIVE_DIRECT_GOTO` | FAIL (prior live attempts) | Direct `page.goto()` returned HTTP 403; it was not retried after the matrix. |
+| `PHASE3_LIVE_RESTORED_TAB_REUSE` | PASS | Adapter and live probe found the exact restored tab and usable composer without navigation. |
+| `PHASE3_LIVE_SINGLE_SEND` | PASS | One Send click; exactly one matching user prompt appeared in the configured conversation. No retry. |
+| `PHASE3_LIVE_OWNED_RESPONSE` | PASS | One assistant response appeared after the unique exact prompt and contained the marker. |
+| `PHASE3_LIVE_RESPONSE_COMPLETION` | PASS | Response remained stable across consecutive reads and no Stop control was visible. |
+| `PHASE3_LIVE_RAW_EXTRACTION` | PASS | Raw response extracted from the assistant Markdown container: `REVIEWRELAY_SMOKE_OK`. |
+| `PHASE3_LIVE_SMOKE_MARKER` | PASS | Expected marker matched exactly. |
+| `PHASE1_REGRESSION` | PASS | Full suite: 276 passed. |
+| `PHASE2_REGRESSION` | PASS | Full suite: 276 passed. |
+| `PHASE3_OFFLINE_REGRESSION` | PASS | Full suite: 276 passed, including whitespace-only composer, paragraph reconstruction, opaque attachments, and modern live turn markup. |
 
-## Safety and remaining blocker
+## Safety and scope
 
-- Auth Mode launches installed Chrome without Playwright or CDP. Automation Mode uses the same dedicated ReviewRelay profile and localhost-only CDP.
-- Auth Mode and Automation Mode share the profile lock; the Owner's default Chrome profile is not used.
-- No cookies or tokens were read, exported, injected, or copied. No credentials or Google login were automated.
-- Prompt/response content was not sent or captured. Only the generated harmless `relay-smoke.txt` was prepared.
-- Live acceptance remains blocked by HTTP 403 on the configured conversation. A valid account session alone was insufficient evidence of access to that conversation. No bypass was attempted.
-
-
-## Follow-up browser boundary diagnostic (2026-09-30)
-
-The diagnostic used the same exact reviewer URL and the same dedicated ReviewRelay profile. The ReviewRelay profile lock was held across both browser modes. Auth Mode was launched with installed Google Chrome, without CDP or Playwright. Automation Mode used the same Chrome executable and profile with `--remote-debugging-address=127.0.0.1`; Playwright remained unattached during the manual B observation.
-
-```text
-NORMAL_CHROME_CONVERSATION_ACCESS=PASS
-CDP_ONLY_CONVERSATION_ACCESS=FAIL
-CDP_PLAYWRIGHT_EXISTING_TAB_ACCESS=NOT_RUN
-CDP_ONLY_HTTP_STATUS=NOT_CAPTURED_BY_OWNER
-DIRECT_PAGE_GOTO_HTTP_STATUS=403 (PREVIOUS RUNS; SAME EXACT URL)
-DIRECT_NAVIGATION_RETRIED_AFTER_MATRIX=NO
-```
-
-For A, the Owner manually opened the exact conversation in normal Auth Mode Chrome and reported that the conversation and composer were usable. For B, the Owner manually opened the same exact URL in Chrome with localhost-only CDP and no Playwright attached, and reported that the conversation/composer were not usable. The Owner did not report an HTTP status for B. C was not run because its stated precondition, B passing, was false. No Playwright attachment or page navigation occurred during B.
-
-The first observed failing boundary is the transition from normal Chrome Auth Mode to CDP-enabled Chrome Automation Mode, before Playwright attaches. Prior runs of `page.goto(exact_conversation_url)` in CDP + Playwright returned HTTP 403, but the B failure without Playwright means `page.goto()` is not the only condition associated with the access failure. The evidence localizes the problem to the CDP-enabled browser/session path; it does not isolate the CDP flag from other startup-mode differences, and the B HTTP status was not captured. The same URL was not requested again after the matrix because the 403 had already been observed.
-
-The dedicated profile had zero Chrome processes after the Owner selected Chrome menu → Exit. The profile lock was then released. No production code or selectors changed: B failed, so existing-tab reuse through Playwright was not established and the restored-tab strategy was not adopted. The prior regression result remains applicable to the unchanged code: `python -m pytest -q` — 267 passed in 28.78s.
+- Only the exact configured reviewer conversation was used; no alternate conversation or private endpoint was used.
+- No authentication workaround, cookie/token operation, credential automation, or Google-login automation was attempted.
+- The only attachment supplied by the successful live smoke was the generated harmless `relay-smoke.txt`; the live input change confirmed that exact file, and the visible composer chip/progress count reached the expected ready state.
+- The exact smoke prompt was sent once. The initial CLI confirmation was ambiguous because live turn selectors had changed; read-only reconciliation confirmed the prompt and response, and no duplicate send was made after the selector fix.
+- Live acceptance is PASS only on the evidence listed above: one exact user prompt, its one subsequent assistant response, stable completion, raw extraction, and the expected marker.
+- Phase 4 was not started.

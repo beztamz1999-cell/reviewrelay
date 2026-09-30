@@ -123,6 +123,57 @@ def test_adapter_dispatches_to_selected_browser_backend(monkeypatch, tmp_path):
     assert calls == ["playwright-chromium", "google-chrome-cdp"]
 
 
+def test_cdp_close_preserves_restored_tabs_until_chrome_saves_session(tmp_path):
+    class _Page:
+        closed = False
+
+        async def close(self):
+            self.closed = True
+
+    class _Context:
+        def __init__(self, page):
+            self.pages = [page]
+
+    class _Session:
+        def __init__(self):
+            self.commands = []
+
+        async def send(self, command):
+            self.commands.append(command)
+
+    class _Browser:
+        def __init__(self, context, session):
+            self.contexts = [context]
+            self.session = session
+
+        async def new_browser_cdp_session(self):
+            return self.session
+
+        async def close(self):
+            pass
+
+    class _Playwright:
+        async def stop(self):
+            pass
+
+    async def run():
+        page = _Page()
+        context = _Context(page)
+        session = _Session()
+        adapter = ChatGPTWebAdapter(
+            tmp_path / "portable",
+            ChatGPTWebSettings(browser_backend=BrowserBackend.GOOGLE_CHROME_CDP),
+        )
+        adapter._context = context
+        adapter._browser = _Browser(context, session)
+        adapter._playwright = _Playwright()
+        await adapter.close()
+        assert page.closed is False
+        assert session.commands == ["Browser.close"]
+
+    asyncio.run(run())
+
+
 def test_chrome_launch_command_uses_dedicated_profile_and_loopback_cdp(tmp_path):
     executable = (tmp_path / "Google Chrome" / "chrome.exe").resolve()
     profile = (tmp_path / "portable" / "browser-profile" / "reviewer-chrome").resolve()
@@ -144,10 +195,11 @@ def test_chrome_launch_command_uses_dedicated_profile_and_loopback_cdp(tmp_path)
     assert not any("remote-debugging" in argument for argument in auth_command)
     assert "--remote-debugging-address=127.0.0.1" in automation_command
     assert "--remote-debugging-port=0" in automation_command
+    assert "--restore-last-session" in automation_command
     assert "--remote-debugging-address=0.0.0.0" not in automation_command
     assert "--profile-directory=Default" not in auth_command + automation_command
     assert auth_command[-1] == "https://chatgpt.com/c/existing"
-    assert automation_command[-1] == "about:blank"
+    assert "about:blank" not in automation_command
 
 
 def test_profile_lock_prevents_auth_and_automation_modes_from_overlapping(tmp_path):

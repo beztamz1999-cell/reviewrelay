@@ -29,6 +29,7 @@
     const mode = params.get("mode") || "normal";
     const conversation = document.querySelector("#conversation");
     const composer = document.querySelector("#composer");
+    const files = document.querySelector("#files");
     const send = document.querySelector("#send");
     const stop = document.querySelector("#stop");
     let nextId = 1;
@@ -39,6 +40,20 @@
       login.textContent = "Log in";
       document.body.append(login);
     }
+    if (mode === "modern-live-opaque-upload") {
+      for (const user of document.querySelectorAll("[data-message-author-role='user']")) {
+        user.removeAttribute("data-message-author-role");
+        user.classList.add("bg-user-message");
+      }
+      for (const assistant of document.querySelectorAll("[data-message-author-role='assistant']")) {
+        const markdown = document.createElement("div");
+        markdown.className = "MarkdownRoot-fixture";
+        markdown.textContent = assistant.textContent;
+        assistant.removeAttribute("data-message-author-role");
+        assistant.classList.add("group", "min-w-0", "flex-col");
+        assistant.replaceChildren(markdown);
+      }
+    }
     if (mode === "missing-composer") composer.remove();
     if (mode === "search-only") {
       composer.remove();
@@ -48,6 +63,38 @@
       document.body.append(search);
     }
     if (mode === "disabled-composer") composer.setAttribute("contenteditable", "false");
+    if (mode === "ask-chatgpt" || mode === "live-opaque-upload" || mode === "modern-live-opaque-upload") composer.setAttribute("aria-label", "Ask ChatGPT");
+    if (mode === "whitespace-empty") composer.innerText = "\n";
+    if (mode === "loading-draft") {
+      const loading = document.createElement("div");
+      loading.setAttribute("role", "status");
+      loading.textContent = "Loading older messages…";
+      document.body.append(loading);
+      setTimeout(() => {
+        const draftFile = document.createElement("div");
+        draftFile.dataset.testid = "attachment-chip";
+        draftFile.textContent = "owner-draft.txt";
+        document.querySelector("#attachments").append(draftFile);
+        loading.remove();
+      }, 200);
+    }
+    if (mode === "lazy-upload") {
+      files.type = "text";
+      files.removeAttribute("aria-label");
+      files.style.display = "none";
+      const addFiles = document.createElement("button");
+      addFiles.type = "button";
+      addFiles.setAttribute("aria-label", "Add files and more");
+      addFiles.textContent = "+";
+      addFiles.disabled = true;
+      setTimeout(() => { addFiles.disabled = false; }, 80);
+      addFiles.addEventListener("click", () => setTimeout(() => {
+        files.type = "file";
+        files.setAttribute("aria-label", "Attach files");
+        files.style.display = "block";
+      }, 60));
+      document.body.append(addFiles);
+    }
     if (mode === "draft") {
       composer.innerText = "Owner draft that must not be overwritten";
       send.disabled = false;
@@ -57,7 +104,7 @@
     composer?.addEventListener("input", () => {
       send.disabled = composer.innerText.length === 0;
     });
-    document.querySelector("#files").addEventListener("change", event => {
+    files.addEventListener("change", event => {
       const files = Array.from(event.target.files || []);
       if (mode === "upload-error") {
         const error = document.createElement("div");
@@ -66,11 +113,40 @@
         document.querySelector("#upload-errors").append(error);
         return;
       }
+      if (mode === "live-opaque-upload" || mode === "modern-live-opaque-upload") {
+        const chip = document.createElement("span");
+        chip.className = "group/composer-attachment";
+        const label = document.createElement("span");
+        label.textContent = "Attachment ready";
+        const remove = document.createElement("button");
+        remove.setAttribute("aria-label", "Remove selected attachment");
+        chip.append(label, remove);
+        document.querySelector("#attachments").append(chip);
+        const progress = document.createElement("div");
+        progress.setAttribute("role", "progressbar");
+        progress.setAttribute("aria-label", "Uploading file");
+        document.querySelector("#attachments").append(progress);
+        setTimeout(() => progress.remove(), 140);
+        return;
+      }
       for (const file of files) {
         const chip = document.createElement("div");
-        chip.dataset.testid = "attachment-chip";
-        chip.textContent = file.name;
-        document.querySelector("#attachments").append(chip);
+        if (mode === "lazy-upload") {
+          const filename = document.createElement("span");
+          filename.textContent = file.name;
+          const remove = document.createElement("button");
+          remove.setAttribute("aria-label", `Remove ${file.name}`);
+          chip.append(filename, remove);
+          const progress = document.createElement("div");
+          progress.setAttribute("role", "progressbar");
+          progress.setAttribute("aria-label", `Uploading ${file.name}`);
+          document.querySelector("#attachments").append(chip, progress);
+          setTimeout(() => progress.remove(), 140);
+        } else {
+          chip.dataset.testid = "attachment-chip";
+          chip.textContent = file.name;
+          document.querySelector("#attachments").append(chip);
+        }
       }
       if (mode === "attachment-extra") {
         const extra = document.createElement("div");
@@ -95,9 +171,13 @@
       }
       if (mode === "ambiguous-send") return;
       const text = composer.innerText;
-      const user = document.createElement("article");
-      user.dataset.messageAuthorRole = "user";
-      user.dataset.messageId = `relay-user-${nextId++}`;
+      const modernLive = mode === "modern-live-opaque-upload";
+      const user = document.createElement(modernLive ? "div" : "article");
+      if (modernLive) user.classList.add("bg-user-message");
+      else {
+        user.dataset.messageAuthorRole = "user";
+        user.dataset.messageId = `relay-user-${nextId++}`;
+      }
       user.textContent = text;
       conversation.append(user);
       composer.innerText = "";
@@ -116,15 +196,24 @@
         ? "Review summary.\n<RELAY_CONTROL>{\"protocol\":\"rr.v1\",\"candidate_sha\":\"abc123\",\"cycle\":1,\"action\":\"PASS\"}</RELAY_CONTROL>\nEnd summary."
         : "Markdown **kept**.\nProse before.\n<RELAY_CONTROL>{\"protocol\":\"rr.v1\",\"candidate_sha\":\"abc123\",\"cycle\":1,\"action\":\"PASS\"}</RELAY_CONTROL>\nProse after.";
       stop.hidden = false;
-      const assistant = document.createElement("article");
-      assistant.dataset.messageAuthorRole = "assistant";
-      assistant.dataset.messageId = `relay-assistant-${nextId++}`;
+      const assistant = document.createElement(modernLive ? "div" : "article");
+      let assistantContent = assistant;
+      if (modernLive) {
+        assistant.classList.add("group", "min-w-0", "flex-col");
+        const markdown = document.createElement("div");
+        markdown.className = "MarkdownRoot-fixture";
+        assistant.append(markdown);
+        assistantContent = markdown;
+      } else {
+        assistant.dataset.messageAuthorRole = "assistant";
+        assistant.dataset.messageId = `relay-assistant-${nextId++}`;
+      }
       conversation.append(assistant);
 
       let index = 0;
       const timer = setInterval(() => {
         index = Math.min(responseText.length, index + 7);
-        assistant.textContent = responseText.slice(0, index);
+        assistantContent.textContent = responseText.slice(0, index);
         if (index === responseText.length) {
           clearInterval(timer);
           stop.hidden = true;

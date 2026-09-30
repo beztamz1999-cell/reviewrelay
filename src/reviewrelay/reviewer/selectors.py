@@ -14,10 +14,16 @@ _LOG = logging.getLogger(__name__)
 class ChatGPTSelectors:
     """Small selector catalog; accessible names precede stable DOM fallbacks."""
 
-    user_turns: str = "[data-message-author-role='user']"
-    assistant_turns: str = "[data-message-author-role='assistant']"
-    file_inputs: str = "input[type='file']"
-    attachment_chips: tuple[str, ...] = ("[data-testid='attachment-chip']",)
+    user_turns: str = "[data-message-author-role='user'], main [class~='bg-user-message']"
+    assistant_turns: str = (
+        "[data-message-author-role='assistant'], "
+        "main [class~='group'][class~='min-w-0'][class~='flex-col']:has([class*='MarkdownRoot-'])"
+    )
+    file_inputs: str = "input[type='file'][aria-label='Attach files']"
+    attachment_chips: tuple[str, ...] = (
+        "[data-testid='attachment-chip']",
+        "button[aria-label^='Remove ']",
+    )
     upload_errors: tuple[str, ...] = (
         "[data-testid='upload-error']",
         "[role='alert']",
@@ -31,10 +37,11 @@ class ChatGPTSelectors:
         "Send",
         "Send prompt",
     )
-    attachment_buttons: tuple[str, ...] = ("Attach files", "Add files", "Upload file")
+    attachment_buttons: tuple[str, ...] = ("Add files and more", "Attach files", "Add files", "Upload file")
 
     def composer_candidates(self, page: Any) -> tuple[tuple[str, Any], ...]:
         return (
+            ("role=textbox[name=Ask ChatGPT]", page.get_by_role("textbox", name="Ask ChatGPT", exact=True)),
             ("role=textbox[name=Message ChatGPT]", page.get_by_role("textbox", name="Message ChatGPT", exact=True)),
             ("role=textbox[name=Message]", page.get_by_role("textbox", name="Message", exact=True)),
             ("testid=prompt-textarea", page.get_by_test_id("prompt-textarea")),

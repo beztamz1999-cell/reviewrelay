@@ -17,6 +17,7 @@ from reviewrelay.reviewer import (
     AttachmentUploadFailed,
     AmbiguousResponse,
     ChatGPTTimeouts,
+    BrowserBackend,
     ChatGPTWebAdapter,
     ChatGPTWebSettings,
     ComposerNotFound,
@@ -168,6 +169,289 @@ def test_navigation_login_and_conversation_readiness(fixture_server, tmp_path):
                 await failed.open_task_conversation()
         finally:
             await failed.close()
+
+    _run(run())
+
+
+def test_ask_chatgpt_composer_accessible_name_is_recognized(fixture_server, tmp_path):
+    async def run():
+        adapter = ChatGPTWebAdapter(tmp_path / "ask-chatgpt", _settings(fixture_server, "ask-chatgpt"))
+        try:
+            target = await adapter.open_task_conversation()
+            assert target == f"{fixture_server}c/test?mode=ask-chatgpt"
+            logical_name, _ = await adapter._require_composer()
+            assert logical_name == "role=textbox[name=Ask ChatGPT]"
+        finally:
+            await adapter.close()
+
+    _run(run())
+
+
+def test_contenteditable_paragraphs_reconstruct_prompt_newlines(fixture_server, tmp_path):
+    async def run():
+        adapter = ChatGPTWebAdapter(tmp_path / "paragraph-composer", _settings(fixture_server, "ask-chatgpt"))
+        try:
+            await adapter.open_task_conversation()
+            _, composer = await adapter._require_composer()
+            lines = ["first line", "second line", "third line"]
+            await composer.evaluate(
+                """(el, paragraphs) => el.replaceChildren(...paragraphs.map(text => {
+                    const paragraph = document.createElement("p");
+                    paragraph.textContent = text;
+                    return paragraph;
+                }))""",
+                lines,
+            )
+            assert await adapter._read_composer_text(composer) == "\n".join(lines)
+        finally:
+            await adapter.close()
+
+    _run(run())
+
+
+def test_cdp_backend_reuses_exact_existing_conversation_tab_without_navigation(fixture_server, tmp_path):
+    async def run():
+        from playwright.async_api import async_playwright
+
+        manager = await async_playwright().start()
+        browser = await manager.chromium.launch(headless=True)
+        context = await browser.new_context()
+        unrelated = await context.new_page()
+        target = f"{fixture_server}c/test?mode=ask-chatgpt"
+        exact = await context.new_page()
+        await exact.goto(target)
+        navigations: list[str] = []
+        exact.on("framenavigated", lambda frame: navigations.append(frame.url))
+
+        class _ConnectedBrowser:
+            contexts = [context]
+
+            def is_connected(self):
+                return True
+
+            async def close(self):
+                pass
+
+        class _NoopPlaywright:
+            async def stop(self):
+                pass
+
+        settings = ChatGPTWebSettings(
+            base_url=fixture_server,
+            conversation_url=target,
+            headless=False,
+            browser_backend="google-chrome-cdp",
+        )
+        adapter = ChatGPTWebAdapter(tmp_path / "cdp-existing-tab", settings)
+        adapter._playwright = _NoopPlaywright()
+        adapter._browser = _ConnectedBrowser()
+        adapter._context = context
+        adapter._page = unrelated
+        try:
+            assert await adapter.open_task_conversation() == target
+            assert adapter.page is exact
+            assert adapter.page.url == target
+            assert navigations == []
+            assert await adapter._find_composer() is not None
+        finally:
+            await context.close()
+            await browser.close()
+            await manager.stop()
+
+    _run(run())
+
+
+def test_cdp_backend_fails_closed_when_exact_conversation_tab_is_missing(fixture_server, tmp_path):
+    async def run():
+        from playwright.async_api import async_playwright
+
+        manager = await async_playwright().start()
+        browser = await manager.chromium.launch(headless=True)
+        context = await browser.new_context()
+        blank = await context.new_page()
+        navigations: list[str] = []
+        blank.on("framenavigated", lambda frame: navigations.append(frame.url))
+
+        class _ConnectedBrowser:
+            contexts = [context]
+
+            def is_connected(self):
+                return True
+
+            async def close(self):
+                pass
+
+        class _NoopPlaywright:
+            async def stop(self):
+                pass
+
+        settings = ChatGPTWebSettings(
+            base_url=fixture_server,
+            conversation_url=f"{fixture_server}c/test?mode=ask-chatgpt",
+            headless=False,
+            browser_backend="google-chrome-cdp",
+        )
+        adapter = ChatGPTWebAdapter(tmp_path / "cdp-missing-tab", settings)
+        adapter._playwright = _NoopPlaywright()
+        adapter._browser = _ConnectedBrowser()
+        adapter._context = context
+        adapter._page = blank
+        try:
+            with pytest.raises(ConversationNavigationFailed):
+                await adapter.open_task_conversation()
+            assert blank.url == "about:blank"
+            assert navigations == []
+        finally:
+            await context.close()
+            await browser.close()
+            await manager.stop()
+
+    _run(run())
+
+
+def test_cdp_backend_verifies_opaque_live_attachment_by_selection_and_chip_count(fixture_server, tmp_path):
+    async def run():
+        from playwright.async_api import async_playwright
+
+        manager = await async_playwright().start()
+        browser = await manager.chromium.launch(headless=True)
+        context = await browser.new_context()
+        target = f"{fixture_server}c/test?mode=modern-live-opaque-upload"
+        page = await context.new_page()
+        await page.goto(target)
+
+        class _ConnectedBrowser:
+            contexts = [context]
+
+            def is_connected(self):
+                return True
+
+            async def close(self):
+                pass
+
+        class _NoopPlaywright:
+            async def stop(self):
+                pass
+
+        data = PortableDataRoot(tmp_path / "live-upload").create()
+        attachment = data.safe_path("active/p/t/scratch/upload/relay-smoke.txt")
+        attachment.parent.mkdir(parents=True)
+        attachment.write_text("Harmless ReviewRelay transport smoke fixture.\n", encoding="utf-8")
+        adapter = ChatGPTWebAdapter(
+            data,
+            ChatGPTWebSettings(
+                base_url=fixture_server,
+                conversation_url=target,
+                headless=False,
+                browser_backend=BrowserBackend.GOOGLE_CHROME_CDP,
+                timeouts=ChatGPTTimeouts(
+                    navigation_seconds=4.0,
+                    upload_seconds=0.8,
+                    response_seconds=0.8,
+                    stability_seconds=0.03,
+                ),
+            ),
+            project_id="p",
+            task_id="t",
+        )
+        adapter._playwright = _NoopPlaywright()
+        adapter._browser = _ConnectedBrowser()
+        adapter._context = context
+        adapter._page = page
+        try:
+            sent = await adapter.send_review_pack(
+                prompt="first line",
+                review_key="opaque-live-upload",
+                attachment_paths=[attachment],
+            )
+            response = await adapter.wait_response(sent)
+            assert response.review_key == sent.review_key
+            assert await page.evaluate("window.__reviewrelayFileSelectionCheckV1.matches") is True
+            assert await page.evaluate("window.sendClicks") == 1
+        finally:
+            await context.close()
+            await browser.close()
+            await manager.stop()
+
+    _run(run())
+
+
+def test_cdp_backend_waits_for_restored_ui_hydration_before_send(fixture_server, tmp_path):
+    async def run():
+        from playwright.async_api import async_playwright
+
+        manager = await async_playwright().start()
+        browser = await manager.chromium.launch(headless=True)
+        context = await browser.new_context()
+        page = await context.new_page()
+        target = f"{fixture_server}c/test?mode=loading-draft"
+        await page.goto(target)
+
+        class _ConnectedBrowser:
+            contexts = [context]
+
+            def is_connected(self):
+                return True
+
+            async def close(self):
+                pass
+
+        class _NoopPlaywright:
+            async def stop(self):
+                pass
+
+        adapter = ChatGPTWebAdapter(
+            tmp_path / "cdp-loading-draft",
+            ChatGPTWebSettings(
+                base_url=fixture_server,
+                conversation_url=target,
+                headless=False,
+                browser_backend=BrowserBackend.GOOGLE_CHROME_CDP,
+                timeouts=ChatGPTTimeouts(
+                    navigation_seconds=6,
+                    upload_seconds=0.35,
+                    response_seconds=0.8,
+                    stability_seconds=0.03,
+                ),
+            ),
+        )
+        adapter._playwright = _NoopPlaywright()
+        adapter._browser = _ConnectedBrowser()
+        adapter._context = context
+        adapter._page = page
+        try:
+            with pytest.raises(ReviewerConversationChanged, match="attachment"):
+                await adapter.send_review_pack(prompt="must not replace draft", review_key="loading-draft")
+            assert await page.evaluate("window.sendClicks") == 0
+            assert await adapter._visible_attachment_names() == ["owner-draft.txt"]
+        finally:
+            await context.close()
+            await browser.close()
+            await manager.stop()
+
+    _run(run())
+
+
+def test_lazy_file_input_is_waited_for_after_add_files_menu(fixture_server, tmp_path):
+    async def run():
+        data = PortableDataRoot(tmp_path / "lazy-upload").create()
+        attachment = data.safe_path("active/fixture/task/scratch/upload/relay-smoke.txt")
+        attachment.parent.mkdir(parents=True, exist_ok=True)
+        attachment.write_text("Harmless fixture attachment.\n", encoding="utf-8")
+        adapter = ChatGPTWebAdapter(data, _settings(fixture_server, "lazy-upload"))
+        try:
+            result = await adapter.send_review_pack(
+                prompt="Fixture upload transport check",
+                review_key="lazy-upload-check",
+                attachment_paths=[attachment],
+            )
+            assert result.disposition is SendDisposition.SEND_CONFIRMED
+            assert await adapter._visible_attachment_names() == ["relay-smoke.txt"]
+            response = await adapter.wait_response(result)
+            assert response.disposition is SendDisposition.RESPONSE_RECEIVED
+            assert await adapter.page.evaluate("window.sendClicks") == 1
+        finally:
+            await adapter.close()
 
     _run(run())
 
@@ -421,6 +705,21 @@ def test_pre_send_manual_changes_and_owner_drafts_are_preserved(fixture_server, 
             assert await attachment_change.page.evaluate("window.sendClicks") == 0
         finally:
             await attachment_change.close()
+
+    _run(run())
+
+
+def test_whitespace_only_composer_is_treated_as_empty(fixture_server, tmp_path):
+    async def run():
+        adapter = ChatGPTWebAdapter(tmp_path / "whitespace-empty", _settings(fixture_server, "whitespace-empty"))
+        try:
+            sent = await adapter.send_review_pack(prompt="relay prompt", review_key="whitespace-empty")
+            response = await adapter.wait_response(sent)
+            assert response.review_key == "whitespace-empty"
+            assert response.assistant_turn_identity not in sent.pre_send_baseline.assistant_turn_ids
+            assert await adapter.page.evaluate("window.sendClicks") == 1
+        finally:
+            await adapter.close()
 
     _run(run())
 

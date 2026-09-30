@@ -121,6 +121,7 @@ class ChatGPTWebAdapter:
         self._cdp_endpoint: str | None = None
         self._start_lock = asyncio.Lock()
         self._navigation_generation = 0
+        self._tracked_pages: set[int] = set()
         self._active_conversation_url: str | None = None
         self._send_registry: OrderedDict[str, tuple[str, SendResult]] = OrderedDict()
         self._responses: dict[str, AssistantResponse] = {}
@@ -177,7 +178,7 @@ class ChatGPTWebAdapter:
                     self._context = contexts[0]
 
                 self._page = self._context.pages[0] if self._context.pages else await self._context.new_page()
-                self._page.on("framenavigated", self._on_frame_navigated)
+                self._track_page(self._page)
                 return self.profile_path
             except BaseException as exc:
                 await self._stop_partial_browser()
@@ -218,20 +219,18 @@ class ChatGPTWebAdapter:
         process = self._chrome_process
         self._cdp_endpoint = None
         self._page = None
+        self._tracked_pages.clear()
         if self.settings.browser_backend is BrowserBackend.GOOGLE_CHROME_CDP:
-            if context is not None:
-                try:
-                    pages = list(context.pages)
-                except Exception:
-                    pages = []
-                for page in pages:
-                    try:
-                        await page.close()
-                    except Exception as exc:
-                        _LOG.debug("ReviewRelay Chrome page close failed: %s", type(exc).__name__)
             if browser is not None:
+                # Closing tabs individually prevents Chrome from restoring the authenticated reviewer tab.
+                # Ask Chrome itself to exit cleanly while its restored tabs are still open.
                 try:
-                    # A CDP-connected Browser.close() disconnects Playwright; it does not own Chrome.
+                    session = await browser.new_browser_cdp_session()
+                    await session.send("Browser.close")
+                except Exception as exc:
+                    _LOG.debug("ReviewRelay Chrome graceful browser close failed: %s", type(exc).__name__)
+                try:
+                    # This disconnects Playwright; Browser.close above owns the graceful Chrome shutdown.
                     await browser.close()
                 except Exception as exc:
                     _LOG.debug("ReviewRelay Chrome CDP disconnect failed: %s", type(exc).__name__)
@@ -364,9 +363,18 @@ class ChatGPTWebAdapter:
         except Exception:
             self._navigation_generation += 1
 
+    def _track_page(self, page: Any) -> None:
+        page_id = id(page)
+        if page_id in self._tracked_pages:
+            return
+        page.on("framenavigated", self._on_frame_navigated)
+        self._tracked_pages.add(page_id)
+
     async def open_task_conversation(self, conversation_url: str | None = None) -> str:
         target = self.settings.resolve_conversation_url(conversation_url)
         await self.start()
+        if self.settings.browser_backend is BrowserBackend.GOOGLE_CHROME_CDP:
+            return await self._reuse_existing_chrome_conversation(target)
         last_error: Exception | None = None
         # A single bounded retry is safe here because no message has been sent.
         for attempt in range(2):
@@ -402,6 +410,90 @@ class ChatGPTWebAdapter:
             raise last_error
         message = f"Could not open configured conversation: {type(last_error).__name__ if last_error else 'unknown'}"
         raise ConversationNavigationFailed(message) from last_error
+
+    async def _reuse_existing_chrome_conversation(self, target: str) -> str:
+        """Use only the exact tab restored by installed Chrome; never navigate it via CDP."""
+        if self._context is None:
+            raise BrowserStartFailed("ReviewRelay Chrome has no attached browser context")
+        pages = [page for page in self._context.pages if not page.is_closed()]
+        matching = [page for page in pages if self._same_conversation(page.url, target)]
+        if len(matching) > 1:
+            raise ConversationNavigationFailed("Multiple existing Chrome tabs match the configured conversation")
+        if not matching:
+            previous_page = self._page
+            for page in pages:
+                self._page = page
+                try:
+                    await self._raise_if_login_required()
+                except LoginRequired:
+                    raise
+                except Exception:
+                    continue
+            self._page = previous_page
+            raise ConversationNavigationFailed(
+                "The configured conversation is not present in an existing ReviewRelay Chrome tab; "
+                "open it manually in Auth Mode and close Chrome normally before Automation Mode"
+            )
+
+        self._page = matching[0]
+        self._track_page(self._page)
+        await self._raise_if_login_required()
+        composer = await self._find_composer()
+        if composer is None:
+            raise ConversationNotReady(await self._diagnostic("restored conversation has no usable composer"))
+        await self._wait_for_live_ui_ready()
+        self._active_conversation_url = target
+        return target
+
+    async def _wait_for_live_ui_ready(self) -> None:
+        """Wait for restored ChatGPT state to hydrate before inspecting drafts or sending."""
+        loop = asyncio.get_running_loop()
+        started = loop.time()
+        deadline = started + self.settings.timeouts.navigation_seconds
+        quiet_since: float | None = None
+        last_snapshot: tuple[int, int, tuple[str, ...]] | None = None
+        while asyncio.get_running_loop().time() < deadline:
+            await self._raise_if_login_required()
+            loading = False
+            statuses = self.page.locator("[role='status']")
+            try:
+                for index in range(await statuses.count()):
+                    status = statuses.nth(index)
+                    if not await status.is_visible():
+                        continue
+                    label = (await status.inner_text()).strip().lower()
+                    if label.startswith(("loading conversation", "loading message", "loading older message")):
+                        loading = True
+                        break
+            except Exception:
+                loading = True
+            if loading:
+                quiet_since = None
+                last_snapshot = None
+                await asyncio.sleep(_POLL_INTERVAL_SECONDS)
+                continue
+
+            snapshot = (
+                await self.page.locator(self.selectors.user_turns).count(),
+                await self.page.locator(self.selectors.assistant_turns).count(),
+                (
+                    await self._visible_composer_attachment_count()
+                    if self.settings.browser_backend is BrowserBackend.GOOGLE_CHROME_CDP
+                    else tuple(await self._visible_attachment_names())
+                ),
+            )
+            now = asyncio.get_running_loop().time()
+            if snapshot != last_snapshot:
+                quiet_since = now
+                last_snapshot = snapshot
+            elif (
+                quiet_since is not None
+                and now - quiet_since >= 0.5
+                and now - started >= 2.0
+            ):
+                return
+            await asyncio.sleep(_POLL_INTERVAL_SECONDS)
+        raise ConversationNotReady(await self._diagnostic("restored conversation UI did not finish loading"))
 
     async def send_review_pack(
         self,
@@ -469,9 +561,14 @@ class ChatGPTWebAdapter:
                 raise ConversationNotReady("The configured conversation is already generating a response")
             composer_entry = await self._require_composer()
             initial_composer_text = await self._read_composer_text(composer_entry[1])
-            if initial_composer_text:
+            if initial_composer_text.strip():
                 raise ReviewerConversationChanged("The configured composer contains an Owner draft; it was preserved and not overwritten")
-            if await self._visible_attachment_names():
+            has_existing_attachments = (
+                await self._visible_composer_attachment_count()
+                if self.settings.browser_backend is BrowserBackend.GOOGLE_CHROME_CDP
+                else bool(await self._visible_attachment_names())
+            )
+            if has_existing_attachments:
                 raise ReviewerConversationChanged("The composer already contains an attachment; it was preserved and not sent")
             await self._upload_attachments(files)
             composer_entry = await self._require_composer()
@@ -715,13 +812,24 @@ class ChatGPTWebAdapter:
     async def _upload_attachments(self, files: tuple[Path, ...]) -> None:
         if not files:
             return
+        live_count_based = self.settings.browser_backend is BrowserBackend.GOOGLE_CHROME_CDP
+        initial_attachment_count = await self._visible_composer_attachment_count() if live_count_based else 0
+        if live_count_based and initial_attachment_count:
+            raise ReviewerConversationChanged("The composer already contains an attachment; it was preserved and not sent")
         locator = self.page.locator(self.selectors.file_inputs)
         try:
             count = await locator.count()
             if count == 0:
-                attach_button = await first_visible_enabled(self.selectors.attachment_button_candidates(self.page))
+                attach_button = await self._wait_for_attachment_button()
                 if attach_button is not None:
                     await attach_button[1].click()
+                    try:
+                        await locator.first.wait_for(
+                            state="attached",
+                            timeout=max(1, int(min(3, self.settings.timeouts.upload_seconds) * 1000)),
+                        )
+                    except Exception:
+                        pass
                     locator = self.page.locator(self.selectors.file_inputs)
                     count = await locator.count()
             if count == 0:
@@ -730,7 +838,34 @@ class ChatGPTWebAdapter:
             multiple = await file_input.get_attribute("multiple")
             if len(files) > 1 and multiple is None:
                 raise AttachmentUploadFailed("The active UI file input does not accept multiple explicit attachments")
+            if live_count_based:
+                await file_input.evaluate(
+                    """(el, expectedNames) => {
+                        window.__reviewrelayFileSelectionCheckV1 = { seen: false, count: 0, matches: false };
+                        el.addEventListener("change", event => {
+                            const selectedNames = Array.from(event.currentTarget.files || []).map(file => file.name);
+                            window.__reviewrelayFileSelectionCheckV1 = {
+                                seen: true,
+                                count: selectedNames.length,
+                                matches: selectedNames.length === expectedNames.length &&
+                                    selectedNames.every((name, index) => name === expectedNames[index]),
+                            };
+                        }, { capture: true, once: true });
+                    }""",
+                    [path.name for path in files],
+                )
             await file_input.set_input_files([str(path) for path in files])
+            if live_count_based:
+                selection_check = await self.page.evaluate(
+                    "() => window.__reviewrelayFileSelectionCheckV1 || null"
+                )
+                if (
+                    not selection_check
+                    or not selection_check.get("seen")
+                    or selection_check.get("count") != len(files)
+                    or not selection_check.get("matches")
+                ):
+                    raise AttachmentUploadFailed("The selected local files did not match the explicitly requested attachments")
         except AttachmentUploadFailed:
             raise
         except Exception as exc:
@@ -741,13 +876,40 @@ class ChatGPTWebAdapter:
         while asyncio.get_running_loop().time() < deadline:
             if await self._visible_upload_error():
                 raise AttachmentUploadFailed("ChatGPT UI reported an attachment upload error")
+            if live_count_based:
+                ready_count = await self._visible_composer_attachment_count()
+                uploading_count = await self._visible_composer_upload_progress_count()
+                if ready_count == len(files) and uploading_count == 0:
+                    return
+                if ready_count > len(files) or uploading_count > len(files):
+                    raise ReviewerConversationChanged("Unexpected attachment count appeared during upload")
+                await asyncio.sleep(_POLL_INTERVAL_SECONDS)
+                continue
             ready_names = await self._visible_attachment_names()
-            if ready_names == pending_names:
+            uploading_names = await self._visible_upload_progress_names()
+            if ready_names == pending_names and not set(pending_names).intersection(uploading_names):
                 return
             if ready_names and ready_names != pending_names[:len(ready_names)]:
                 raise ReviewerConversationChanged("Unexpected or reordered attachment appeared during upload")
             await asyncio.sleep(_POLL_INTERVAL_SECONDS)
         raise AttachmentUploadFailed("Attachment did not become visibly ready before the upload timeout")
+
+    async def _wait_for_attachment_button(self) -> tuple[str, Any] | None:
+        candidates = self.selectors.attachment_button_candidates(self.page)
+        deadline = asyncio.get_running_loop().time() + min(5, self.settings.timeouts.upload_seconds)
+        while True:
+            result = await first_visible_enabled(candidates)
+            if result is not None:
+                return result
+            present = False
+            for _, locator in candidates:
+                try:
+                    present = present or await locator.count() > 0
+                except Exception:
+                    continue
+            if not present or asyncio.get_running_loop().time() >= deadline:
+                return None
+            await asyncio.sleep(_POLL_INTERVAL_SECONDS)
 
     async def _visible_attachment_names(self) -> list[str]:
         names: list[str] = []
@@ -760,11 +922,65 @@ class ChatGPTWebAdapter:
                         continue
                     text = (await item.inner_text()).strip()
                     title = await item.get_attribute("title")
+                    aria_label = await item.get_attribute("aria-label")
                     value = text or title
-                    if value:
+                    if not value and aria_label and aria_label.startswith("Remove "):
+                        value = aria_label.removeprefix("Remove ").strip()
+                    if value and value not in names:
                         names.append(value)
             except Exception:
                 continue
+        return names
+
+    async def _visible_composer_attachment_count(self) -> int:
+        """Count visible composer chips without reading their labels or historical message attachments."""
+        for selector in ("[data-testid='attachment-chip']", "button[aria-label^='Remove ']" ):
+            locator = self.page.locator(selector)
+            visible_count = 0
+            try:
+                for index in range(await locator.count()):
+                    item = locator.nth(index)
+                    if not await item.is_visible():
+                        continue
+                    if await item.evaluate("el => !!el.closest('[data-message-author-role]')"):
+                        continue
+                    visible_count += 1
+            except Exception:
+                continue
+            if visible_count:
+                return visible_count
+        return 0
+
+    async def _visible_composer_upload_progress_count(self) -> int:
+        locator = self.page.locator("[role='progressbar'][aria-label^='Uploading ']")
+        visible_count = 0
+        try:
+            for index in range(await locator.count()):
+                item = locator.nth(index)
+                if not await item.is_visible():
+                    continue
+                if await item.evaluate("el => !!el.closest('[data-message-author-role]')"):
+                    continue
+                visible_count += 1
+        except Exception:
+            return visible_count
+        return visible_count
+
+    async def _visible_upload_progress_names(self) -> list[str]:
+        locator = self.page.locator("[role='progressbar'][aria-label^='Uploading ']")
+        names: list[str] = []
+        try:
+            for index in range(await locator.count()):
+                item = locator.nth(index)
+                if not await item.is_visible():
+                    continue
+                label = await item.get_attribute("aria-label")
+                if label and label.startswith("Uploading "):
+                    filename = label.removeprefix("Uploading ").strip()
+                    if filename and filename not in names:
+                        names.append(filename)
+        except Exception:
+            return names
         return names
 
     async def _visible_upload_error(self) -> bool:
@@ -793,7 +1009,20 @@ class ChatGPTWebAdapter:
     async def _read_composer_text(self, composer: Any) -> str:
         if await composer.evaluate("el => 'value' in el"):
             return await composer.input_value()
-        return await composer.inner_text()
+        return await composer.evaluate(
+            """el => {
+                const blocks = Array.from(el.children);
+                const blockTags = new Set(["P", "DIV", "LI", "PRE", "BLOCKQUOTE"]);
+                if (blocks.length && blocks.every(block => blockTags.has(block.tagName))) {
+                    return blocks
+                        .map(block => (block.innerText ?? block.textContent ?? "")
+                            .replace(/\\r\\n?/g, "\\n")
+                            .replace(/\\n+$/g, ""))
+                        .join("\\n");
+                }
+                return el.innerText ?? "";
+            }"""
+        )
 
     async def _raise_if_login_required(self) -> None:
         current_url = self.page.url

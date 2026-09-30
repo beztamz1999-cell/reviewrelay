@@ -80,7 +80,7 @@ class ProjectConfig:
     project_id: str
     repo: RepoConfig
     review: ReviewConfig = field(default_factory=ReviewConfig)
-    tests: dict[str, str] = field(default_factory=dict)
+    tests: dict[str, str | tuple[str, ...]] = field(default_factory=dict)
     security: SecurityConfig = field(default_factory=SecurityConfig)
     storage: StorageConfig = field(default_factory=StorageConfig)
     chatgpt: dict[str, Any] = field(default_factory=dict)
@@ -120,12 +120,22 @@ class ProjectConfig:
         )
 
         tests_raw = _mapping(raw.get("tests", {}), "tests")
-        tests: dict[str, str] = {}
+        tests: dict[str, str | tuple[str, ...]] = {}
         for test_id, test_value in tests_raw.items():
             if not isinstance(test_id, str) or not _ID_RE.fullmatch(test_id):
                 raise ConfigError(f"Invalid test registry id: {test_id!r}")
             if isinstance(test_value, dict):
-                _keys(test_value, {"command"}, f"tests.{test_id}")
+                _keys(test_value, {"command", "argv"}, f"tests.{test_id}")
+                if "argv" in test_value:
+                    if "command" in test_value:
+                        raise ConfigError(f"tests.{test_id} cannot combine argv and command")
+                    argv = test_value["argv"]
+                    if not isinstance(argv, list) or not argv or any(
+                        not isinstance(arg, str) or "\x00" in arg for arg in argv
+                    ) or not argv[0].strip():
+                        raise ConfigError(f"tests.{test_id}.argv must be a non-empty string array")
+                    tests[test_id] = tuple(argv)
+                    continue
                 command = test_value.get("command")
             else:
                 command = test_value
@@ -187,7 +197,10 @@ class ProjectConfig:
                 "full_changed_files_limit": self.review.full_changed_files_limit,
                 "keep_final_patch": self.review.keep_final_patch,
             },
-            "tests": {test_id: {"command": command} for test_id, command in sorted(self.tests.items())},
+            "tests": {
+                test_id: ({"command": command} if isinstance(command, str) else {"argv": list(command)})
+                for test_id, command in sorted(self.tests.items())
+            },
             "security": {
                 "block_secrets": self.security.block_secrets,
                 "block_env_files": self.security.block_env_files,

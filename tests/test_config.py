@@ -79,3 +79,23 @@ def test_stores_validated_config_inside_portable_data_root(tmp_path) -> None:
     stored = root.store_project_config(config)
     assert stored == root.path / "config" / "projects" / "gacha-v4.yaml"
     assert ProjectConfig.load(stored) == config
+
+
+def test_explicit_test_argv_round_trips_and_rejects_ambiguous_registry() -> None:
+    config = ProjectConfig.from_yaml("""
+project_id: local
+repo: {path: C:/repo}
+tests:
+  selected:
+    argv: [python, -m, pytest, "tests/with space.py", -q]
+""")
+    assert config.tests["selected"] == ("python", "-m", "pytest", "tests/with space.py", "-q")
+    import yaml
+    assert ProjectConfig.from_yaml(yaml.safe_dump(config.to_mapping())) == config
+    with pytest.raises(ConfigError):
+        ProjectConfig.from_yaml("""
+project_id: local
+repo: {path: C:/repo}
+tests:
+  invalid: {argv: [python], command: python}
+""")

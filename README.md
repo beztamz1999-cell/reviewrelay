@@ -4,7 +4,7 @@ ReviewRelay is a small standalone foundation for relaying implementation work to
 
 ## Status
 
-Phases 1–4 are implemented. Phase 3 provides the ChatGPT web transport; Phase 4 provides a separately invoked Codex app-server worker adapter. Live smoke procedures are explicit development tools and are not part of automated tests.
+Phases 1–5 are implemented. Phase 3 provides the ChatGPT web transport; Phase 4 provides a separately invoked Codex app-server worker adapter; Phase 5 collects validated evidence locally. Live model smoke procedures are explicit development tools and are not part of automated tests.
 
 ## Development
 
@@ -73,7 +73,7 @@ The smoke prints the raw response and requires the new owned response to contain
 
 ## Deferred scope
 
-Evidence execution engine, autonomous review loop, secret scanner, Windows UI, cloud service, arbitrary reviewer-driven shell execution, and production/release logic remain deferred. Configured test commands remain registry data and are not executed by ReviewRelay.
+Autonomous review loop, secret scanner, Windows UI, cloud service, arbitrary reviewer-driven shell execution, and production/release logic remain deferred. Configured test commands are executed only when a validated Phase 2 `test_id` selects them during local evidence collection.
 
 ## Phase 4 worker adapter
 
@@ -92,3 +92,15 @@ python -m reviewrelay.dev.codex_smoke --data-root "G:\REVIEW_RELAY_DATA" --model
 ```
 
 It creates a harmless file, shuts down app-server, resumes the exact saved thread in a new process, reads the file, and removes the disposable repository. `model/list` is informational; only a completed live inference verifies account access. Automated worker tests use a fake stdio subprocess and consume no Codex quota.
+
+## Phase 5 local evidence executor
+
+`LocalEvidenceExecutor.execute_batch` accepts only Phase 2 typed requests with an `EvidenceExecutionContext` binding project, task, repository, base/candidate SHAs, review cycle, project configuration, and managed task storage. It supports all nine whitelisted evidence operations. Path reads resolve within the repository; Git uses fixed argument arrays; only a configured test registry ID may launch a test process. New test configuration should use an `argv` list. Existing string `command` entries use deterministic double-quote/backslash tokenization without a shell; single quotes and shell metacharacters remain literal characters.
+
+```yaml
+tests:
+  unit:
+    argv: [python, -m, pytest, tests/unit, -q]
+```
+
+Results and a SHA-256 manifest are written to `active/<project>/<task>/scratch/evidence/cycle-<NN>/batch-<id>/`. A complete result exposes `upload_artifacts` in manifest-first request order. Incomplete or mutated batches expose no upload paths. A failed configured test is valid evidence with `TEST_FAIL`; timeout and launch failure leave the batch incomplete. Strict clean candidates are required for upload. A dirty candidate can be inspected using `git_status`, but that batch is incomplete. This stage does not contact ChatGPT or Codex.

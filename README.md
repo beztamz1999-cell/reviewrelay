@@ -60,6 +60,16 @@ Run the foundation tests with `python -m pytest -q tests/test_projects.py tests/
 
 ## Phase 7 autonomous Tasks
 
+### Codex Workers and Owner manual steer (Phase 7.1)
+
+The selected Project's **Codex Workers** list shows each Task and its typed backend status. **Open Worker** opens that Task's persisted identity/activity in the detail panel: Project ID, Task ID, worker thread ID, repository and deterministic GitHub Task branch. It does not create a thread.
+
+**Pause Auto Relay** immediately enters `PAUSED_OWNER_STEER` at an idle safe boundary. During a worker turn, push, reviewer/evidence send or other active operation, the list shows `PAUSE_PENDING`; the effect finishes before the pause becomes effective. Unknown external outcomes remain blocked. **Send Manual Instruction** is enabled only for a safely paused Task with an existing, consistent thread. It resumes that exact app-server thread and sends only the explicit Owner instruction to it. No replacement thread or cross-Project dispatch is permitted.
+
+Manual completion checks durable thread/turn identity, repository, unchanged local execution branch, frozen GitHub Task branch/destination, clean committed Git state, ancestry and canonical specification independently. A new candidate invalidates the old review and waits for **Resume Auto Relay** to use the normal publish/review path. A turn with no candidate preserves the previous workflow and permits another instruction or resume. Manual steering never creates review PASS. Resume uses durable effects/raw responses and cannot repeat a completed worker turn, push or reviewer send. The existing **Owner Decision** action remains a separate continuation to the reviewer.
+
+Offline coverage: `python -m pytest -q tests/test_worker_management.py tests/test_task_ui.py tests/test_worker_adapter.py`. This includes real temporary Git/bare remotes, SQLite, Qt and the public app-server protocol fixture; it consumes no live Codex inference. No Phase 8 work is included.
+
 Select a ready Project, open **Tasks / + New Task**, then **+ New Task**. Enter the Task ID, title and requirement. **Create and Commit Task Specification** intentionally writes only `.reviewrelay/tasks/<TASK_ID>.md`, commits it and records the actual clean Git HEAD as `BASE_SHA`. Unrelated local changes block creation. No worker runs until **Start**.
 
 The canonical spec is immutable by default. Spec changes require the explicit creation-time checkbox; they cannot be authorized retroactively by a reviewer or restart. A new implementation commit is required by default. Task creation also captures fix/evidence limits (defaults 3/5) and an optional Owner-configured test registry of fixed argv commands. A reviewer selects only validated Phase 2 test IDs.

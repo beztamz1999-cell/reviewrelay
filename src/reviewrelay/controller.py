@@ -23,6 +23,7 @@ from .reviewer.chatgpt_web import ChatGPTWebAdapter
 from .worker.base import TurnStatus
 from .worker.codex_app_server import CodexAppServerAdapter
 from .worker.lock import WorkerTaskLock
+from .worker_management import WorkerManagement
 
 
 def _hash(text):
@@ -33,7 +34,7 @@ class _Halt(Exception):
     pass
 
 
-class TaskController:
+class TaskController(WorkerManagement):
     def __init__(self, root, project_id, *, worker_factory=None, reviewer_factory=None,
                  publisher_factory=None, evidence_factory=LocalEvidenceExecutor, git=None, checkpoint_observer=None):
         self.root, self.project_id = root.create(), validate_identifier(project_id, "project_id")
@@ -194,6 +195,13 @@ class TaskController:
         if action == "PAUSE":
             self._save(task, "TASK_PAUSED", state=S.PAUSED_USER, resume_state=task.state.value)
             raise _Halt()
+        if action == "STEER_PAUSE":
+            if self._unsafe_for_steer(task):
+                # Unknown effects after restart remain pending, never authorize
+                # a new worker/send merely to satisfy the pause request.
+                raise _Halt()
+            self._pause_for_steer(task)
+            raise _Halt()
 
     async def _wait(self, awaitable, task, *, guard=False, worker=False):
         waiting = asyncio.ensure_future(awaitable)
@@ -222,6 +230,12 @@ class TaskController:
         try:
             project_lock = self._project_lock()
             task = self.store.get(self.project_id, task_id)
+            if self.store.control(self.project_id, task_id) == "STOP" and task.state is not S.STOPPED:
+                self._check_control(task)
+            if self.store.control(self.project_id, task_id) == "STEER_PAUSE" and task.state is not S.PAUSED_OWNER_STEER:
+                self._check_control(task)
+            if task.state is S.PAUSED_OWNER_STEER:
+                return task  # Only explicit resume_auto_relay releases Owner steer.
             if task.state in {S.COMPLETE, S.STOPPED}:
                 return task
             if self.store.control(self.project_id, task_id) == "STOP":
@@ -272,6 +286,10 @@ class TaskController:
         except _Halt:
             return self.store.get(self.project_id, task_id)
         except Exception as exc:
+            if project_lock is None:
+                # A rejected competing controller owns no repository workflow.
+                # It must not overwrite an Owner-steer pause with PAUSED_ERROR.
+                raise
             task = self.store.get(self.project_id, task_id)
             if task.state is not S.STOPPED:
                 code = getattr(exc, "code", "CONTROLLER_FAILED")
@@ -348,14 +366,17 @@ class TaskController:
         if record.worker_thread_id != thread or record.worker_last_turn_id != turn or record.worker_last_turn_status != "COMPLETED":
             raise ControllerError("Worker durable completion differs", code="WORKER_COMPLETION_INVALID")
         self._effect(task, key, kind, "COMPLETED", payload)
+        self._record_worker_events(task, turn)
+        return self._save(task, "WORKER_TURN_COMPLETED", state=S.VERIFYING_CANDIDATE)
+
+    def _record_worker_events(self, task, turn):
         for event in tuple(getattr(self.worker, "timeline", ())):
             if event.turn_id == turn and event.kind in {"COMMAND_STARTED", "COMMAND_COMPLETED", "FILE_CHANGE", "TOOL_ACTIVITY", "TURN_STARTED", "TURN_COMPLETED"}:
                 with self.store.db:
                     self.store._event(task, "CODEX_" + event.kind, {"turn_id": event.turn_id, "command": event.command,
                         "exit_code": event.exit_code, "paths": event.paths})
-        return self._save(task, "WORKER_TURN_COMPLETED", state=S.VERIFYING_CANDIDATE)
 
-    async def _verify_candidate(self, task, config):
+    async def _verify_candidate(self, task, config, *, owner_steer=False):
         record = self.store.state.get(self.project_id, task.task_id)
         if (record.worker_thread_id != task.worker_thread_id or record.worker_last_turn_id != task.worker_turn_id
                 or record.worker_last_turn_status != "COMPLETED"):
@@ -371,9 +392,11 @@ class TaskController:
             raise ControllerError("Canonical Task specification is missing", code="TASK_SPEC_MISSING")
         if not task.allow_spec_change and _hash(path.read_text(encoding="utf-8")) != task.spec_digest:
             raise ControllerError("Worker modified the Task specification", code="TASK_SPEC_MUTATED")
-        return self._save(task, "CANDIDATE_VERIFIED", state=S.PUBLISHING, previous_candidate_sha=task.candidate_sha,
+        extra = dict(steer_state=S.PUBLISHING.value, manual_pending={}, last_review_key=None,
+            ready_for_owner_review=False) if owner_steer else {}
+        return self._save(task, "CANDIDATE_VERIFIED", state=S.PAUSED_OWNER_STEER if owner_steer else S.PUBLISHING, previous_candidate_sha=task.candidate_sha,
             candidate_sha=verified.candidate_sha, candidate_created_at=utc_now_iso(), review_cycle=task.review_cycle + 1,
-            pending={}, published=None)
+            pending={}, published=None, **extra)
 
     def _queue_message(self, task, kind, prompt):
         number = task.message_number + 1

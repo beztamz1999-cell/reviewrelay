@@ -43,6 +43,9 @@ class Harness:
         self.root, self.repo, self.remote, self.project = root, repo, remote, project
         self.actions = ["PASS"]
         self.initial = self.fixes = self.sends = self.batches = 0
+        self.manuals = []
+        self.manual_no_commit = False
+        self.manual_fault = None
         self.worker_fault = None
         self.fix_fault = None
         self.fail_send_number = None
@@ -64,6 +67,7 @@ class Harness:
             timeline = ()
             def __init__(self, config, task):
                 self.task, self.config, self.thread, self.turn = task, config, None, None
+                self.manual = False
                 harness.workers.append(self)
 
             async def start_task(self, prompt):
@@ -74,14 +78,18 @@ class Harness:
                 return await self.start(prompt)
 
             async def send_instruction(self, prompt):
-                harness.fixes += 1
-                assert "reviewer instruction" in prompt and "validated fix" in prompt
+                self.manual = prompt.startswith("ReviewRelay Owner manual instruction")
+                if self.manual:
+                    harness.manuals.append((self.task.task_id, prompt))
+                else:
+                    harness.fixes += 1
+                    assert "reviewer instruction" in prompt and "validated fix" in prompt
                 with StateStore(harness.root) as state:
                     self.thread = state.get(self.task.project_id, self.task.task_id).worker_thread_id
                 return await self.start(prompt)
 
             async def start(self, prompt):
-                self.turn = f"turn-{harness.initial}-{harness.fixes}"
+                self.turn = f"turn-{harness.initial}-{harness.fixes}-{len(harness.manuals)}"
                 with StateStore(harness.root) as state:
                     r = state.get(self.task.project_id, self.task.task_id)
                     state.save(replace(r, worker_thread_id=self.thread, worker_session_identity=self.thread,
@@ -96,9 +104,11 @@ class Harness:
                     await harness.worker_gate.wait()
                 if harness.worker_fault == "failure":
                     raise ControllerError("Fake worker failed", code="WORKER_TURN_FAILED")
-                if harness.worker_fault != "no_commit":
+                if self.manual and harness.manual_fault == "branch":
+                    git(harness.repo, "switch", "-c", "unexpected-branch")
+                if harness.worker_fault != "no_commit" and not (self.manual and harness.manual_no_commit):
                     path = harness.repo / (task_spec_path(self.task.task_id) if harness.worker_fault == "spec" else "result.txt")
-                    path.write_text("worker requirement rewrite" if harness.worker_fault == "spec" else f"candidate-{harness.initial}-{harness.fixes}\n", encoding="utf-8")
+                    path.write_text("worker requirement rewrite" if harness.worker_fault == "spec" else f"candidate-{harness.initial}-{harness.fixes}-{len(harness.manuals)}\n", encoding="utf-8")
                     if harness.worker_fault != "dirty":
                         git(harness.repo, "add", "--", str(path.relative_to(harness.repo)))
                         git(harness.repo, "commit", "-m", "fake worker candidate")
@@ -111,7 +121,7 @@ class Harness:
                 self.timeline = (WorkerEvent("COMMAND_COMPLETED", utc_now_iso(), self.thread, self.turn,
                     command="harmless offline verification", exit_code=0),
                     WorkerEvent("reasoning", utc_now_iso(), self.thread, self.turn, text="Never expose reasoning"))
-                return WorkerTurnResult("wrong-thread" if harness.worker_fault == "thread" else self.thread,
+                return WorkerTurnResult("wrong-thread" if harness.worker_fault == "thread" or (self.manual and harness.manual_fault == "thread") else self.thread,
                     self.turn, TurnStatus.COMPLETED, "Untrusted narrative SHA=" + "a" * 40, Path("unused-trace"))
 
             def get_session_identity(self):

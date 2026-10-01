@@ -27,6 +27,7 @@ class ControllerState(str, Enum):
     COLLECTING_EVIDENCE = "COLLECTING_EVIDENCE"
     SENDING_EVIDENCE = "SENDING_EVIDENCE"
     PAUSED_USER = "PAUSED_USER"
+    PAUSED_OWNER_STEER = "PAUSED_OWNER_STEER"
     PAUSED_OWNER = "PAUSED_OWNER"
     PAUSED_ERROR = "PAUSED_ERROR"
     COMPLETE = "COMPLETE"
@@ -67,6 +68,9 @@ class ControllerTask:
     reason: str | None = None
     context: str | None = None
     owner_inputs: tuple[dict, ...] = ()
+    steer_state: str | None = None
+    manual_number: int = 0
+    manual_pending: dict = field(default_factory=dict)
     created_at: str = field(default_factory=utc_now_iso)
     updated_at: str = field(default_factory=utc_now_iso)
 
@@ -87,6 +91,7 @@ _LEGACY_STATE = {ControllerState.DRAFT: TaskState.IDLE, ControllerState.READY: T
     ControllerState.COLLECTING_EVIDENCE: TaskState.COLLECT_EVIDENCE,
     ControllerState.SENDING_EVIDENCE: TaskState.SEND_EVIDENCE,
     ControllerState.PAUSED_USER: TaskState.PAUSED_OWNER,
+    ControllerState.PAUSED_OWNER_STEER: TaskState.PAUSED_OWNER,
     ControllerState.PAUSED_OWNER: TaskState.PAUSED_OWNER,
     ControllerState.PAUSED_ERROR: TaskState.PAUSED_ERROR,
     ControllerState.COMPLETE: TaskState.COMPLETE, ControllerState.STOPPED: TaskState.ABORTED}
@@ -152,7 +157,7 @@ class ControllerStore:
 
     def dispatch(self, task, key, kind, counter):
         """Commit the intent, conservative dispatch counter and event together."""
-        task = replace(task, counters={**task.counters, counter: task.counters[counter] + 1}, updated_at=utc_now_iso())
+        task = replace(task, counters={**task.counters, counter: task.counters.get(counter, 0) + 1}, updated_at=utc_now_iso())
         with self.db:
             self.db.execute("UPDATE controller_effects SET status='IN_FLIGHT',updated_at=? WHERE effect_key=?",
                 (task.updated_at, key))
@@ -175,16 +180,33 @@ class ControllerStore:
 
     def control(self, project_id, task_id, action=None):
         if action is not None:
-            if action not in {"PAUSE", "STOP", "CLEAR"}:
+            if action not in {"PAUSE", "STOP", "CLEAR", "STEER_PAUSE"}:
                 raise ValueError("Unknown controller control")
             with self.db:
-                self.db.execute("UPDATE controller_tasks SET control=? WHERE project_id=? AND task_id=?",
-                    (None if action == "CLEAR" else action, project_id, task_id))
+                self.db.execute("UPDATE controller_tasks SET control=? WHERE project_id=? AND task_id=? "
+                    "AND (control IS NULL OR control!='STOP' OR ? IN ('STOP','CLEAR')) "
+                    "AND (control IS NULL OR control!='STEER_PAUSE' OR ?!='PAUSE')",
+                    (None if action == "CLEAR" else action, project_id, task_id, action, action))
         row = self.db.execute("SELECT control FROM controller_tasks WHERE project_id=? AND task_id=?", (project_id, task_id)).fetchone()
         return row[0] if row else None
 
     def close(self):
         self.state.close()
+
+    def release_steer(self, task):
+        task = replace(task, state=ControllerState(task.steer_state), steer_state=None, updated_at=utc_now_iso())
+        with self.db:
+            self.db.execute("UPDATE controller_tasks SET record_json=?,control=NULL WHERE project_id=? AND task_id=? AND control='STEER_PAUSE'",
+                (json.dumps(asdict(task), sort_keys=True), task.project_id, task.task_id))
+            if self.db.execute("SELECT changes()").fetchone()[0] != 1:
+                raise ControllerError("Owner control changed", code="OWNER_STEER_NOT_SAFE")
+            self.db.execute("UPDATE tasks SET task_state=?,updated_at=? WHERE project_id=? AND task_id=?",
+                (_LEGACY_STATE[task.state].value, task.updated_at, task.project_id, task.task_id))
+            self._event(task, "AUTO_RELAY_RESUMED", {})
+        record = self.state.get(task.project_id, task.task_id)
+        if record:
+            self.storage.persist_task_record(record)
+        return task
 
     def __enter__(self):
         return self

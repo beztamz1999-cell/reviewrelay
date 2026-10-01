@@ -162,3 +162,90 @@ def test_stop_from_owner_pause_is_terminal_without_new_calls(window, h, app):
     spin(app, lambda: not window.busy, timeout=120)
     assert "State: STOPPED" in window.summary.text()
     assert h.initial == h.sends == 1 and h.fixes == 0
+
+
+def test_worker_panel_exact_identity_open_pause_manual_and_resume(window, h, app, monkeypatch):
+    c, task = h.create()
+    assert run(c.run(task.task_id)).state is S.COMPLETE
+    identity = c.open_worker(task.task_id).identity
+    c.close()
+    h.manual_no_commit = True
+    window.refresh()
+    assert window.tasks.item(0).text() == task.task_id + " — COMPLETE"
+    for field, value in (("PROJECT_ID", identity.project_id), ("TASK_ID", identity.task_id),
+            ("WORKER_THREAD_ID", identity.worker_thread_id), ("REPOSITORY", identity.repository),
+            ("TASK_BRANCH", identity.task_branch)):
+        assert f"{field}={value}" in window.worker_identity.text()
+    window.open_worker_button.click()
+    assert "Opened worker" in window.message.text()
+    window.pause_auto_button.click()
+    assert "PAUSED_OWNER_STEER" in window.tasks.item(0).text()
+    assert window.manual_button.isEnabled() and window.resume_auto_button.isEnabled()
+    assert not window.resume_button.isEnabled()
+    monkeypatch.setattr(QInputDialog, "getMultiLineText", lambda *args: ("Inspect only this selected Task", True))
+    window.manual_button.click()
+    spin(app, lambda: not window.busy, timeout=120)
+    assert h.manuals[0][0] == task.task_id and h.initial == h.sends == 1 and h.fixes == 0
+    assert "MANUAL_THREAD_IDENTITY_VERIFIED" in window.timeline.toPlainText()
+    assert identity.worker_thread_id in window.worker_identity.text()
+    window.resume_auto_button.click()
+    spin(app, lambda: not window.busy, timeout=120)
+    assert "State: COMPLETE" in window.summary.text()
+    assert h.initial == h.sends == 1 and len(h.manuals) == 1
+
+
+def test_worker_panel_project_scoping_and_selected_task_only(window, h, app, monkeypatch):
+    c, a = h.create()
+    a = run(c.run(a.task_id))
+    _, b = h.create(c, task="TASK-2")
+    h.actions = ["PASS"]
+    b = run(c.run(b.task_id))
+    c.store.save(replace(a, project_id="unrelated", task_id="FOREIGN-TASK"), "FOREIGN_FIXTURE")
+    c.close()
+    window.refresh()
+    assert window.tasks.count() == 2
+    h.manual_no_commit = True
+    monkeypatch.setattr(QInputDialog, "getMultiLineText", lambda *args: ("Inspect only", True))
+    for row, task in enumerate((a, b)):
+        git(h.repo, "switch", "-c", "ui-execution-" + task.task_id, task.candidate_sha)
+        window.tasks.setCurrentRow(row)
+        window.pause_auto_button.click()
+        window.manual_button.click()
+        spin(app, lambda: not window.busy, timeout=120)
+        assert h.manuals[-1][0] == task.task_id
+    assert [t for t, _ in h.manuals] == [a.task_id, b.task_id]
+    assert h.initial == h.sends == 2
+
+
+def test_worker_pending_typed_status_disables_manual_action(window, h, app):
+    c, task = h.create()
+    task = run(c.run(task.task_id))
+    c.store.put_effect(task, "unknown-send", "REVIEW_SEND", "AMBIGUOUS", {})
+    c.close()
+    window.refresh()
+    window.pause_auto_button.click()
+    assert "PAUSE_PENDING" in window.tasks.item(0).text()
+    assert not window.manual_button.isEnabled() and not window.resume_auto_button.isEnabled()
+
+
+def test_manual_job_keeps_original_selection_when_owner_selects_other_worker(window, h, app, monkeypatch):
+    c, a = h.create()
+    a = run(c.run(a.task_id))
+    _, b = h.create(c, task="TASK-2")
+    h.actions = ["PASS"]
+    run(c.run(b.task_id))
+    c.close()
+    git(h.repo, "switch", "-c", "selected-ui-task", a.candidate_sha)
+    window.refresh()
+    window.tasks.setCurrentRow(0)
+    window.pause_auto_button.click()
+    monkeypatch.setattr(QInputDialog, "getMultiLineText", lambda *args: ("Keep captured selection", True))
+    captured = []
+    monkeypatch.setattr(window, "start_job", lambda work, task_id: captured.append((work, task_id)))
+    window.manual_button.click()
+    window.tasks.setCurrentRow(1)
+    assert window.task_id == b.task_id and captured[0][1] == a.task_id
+    h.manual_no_commit = True
+    captured[0][0]()
+    assert h.manuals[-1][0] == a.task_id
+    assert "WORKER_THREAD_ID=thread-" + a.task_id in h.manuals[-1][1]

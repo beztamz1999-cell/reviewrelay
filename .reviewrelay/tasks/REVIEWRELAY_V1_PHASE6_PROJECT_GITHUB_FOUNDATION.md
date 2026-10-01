@@ -1,0 +1,11 @@
+# Phase 6: Project + GitHub Foundation
+
+Owner-approved task contract, created before implementation on clean local HEAD `48bec749871b7a65d02e3cea00a7b7936d9738f6`. Retain its existing GitHub bridge and all accepted Phase 1–5 behavior.
+
+Projects bind one resolved local repository to one canonical GitHub repository, with N tasks. Persist registry/setup state in the existing SQLite database. New projects initialize Git and an empty commit without fake source. Existing non-Git projects require explicit initialization and a reviewed snapshot confirmation before staging/committing. Detect HTTPS/SSH remotes without silent binding. Create or link GitHub through supported local tooling, select visibility explicitly, confirm public exposure, check obvious sensitive paths before public publication, and reject divergent/unrelated history without destructive Git operations.
+
+Journal repository creation, remote addition and exact initial push; recover by read-only reconciliation without duplicate repository creation or blind push retries. Verify SHA equality after publishing. Enforce unique local/GitHub identities and stable renameable Project IDs. Unregister only registration, preserving local source, GitHub and task history.
+
+GitHub readiness precedes reviewer/runtime connection. Reuse the dedicated Phase 3 Chrome/profile flow with no messages, credential automation or cookie/token extraction. Validate selected Codex executable/capability/auth locally without inference or thread creation. Threads stay per Task. Preserve task-spec/path security, exact task-branch publishing and zero-attachment GitHub notifications with Project identity. No autonomous loop or New Task UI.
+
+Implement only PySide6 Project Hub/setup, New vs Existing choices, detection/create/link, typed status/errors, nonblocking jobs, busy/duplicate-click guards and unregister confirmation. Test real temporary/bare Git repositories, fake GitHub/reviewer/runtime services, migration from Phase 5, restart/ambiguity/public safety and UI behavior. Run required local Project-to-task publishing smoke, targeted/full regression, canonical docs, staged full regression, compile/diff checks, one local commit and clean worktree. No Phase 6 report/audit files, development-repository push, live GitHub creation without an authorized destination, or Phase 7.

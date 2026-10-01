@@ -201,6 +201,17 @@ async def wait_for_chrome_exit(process: subprocess.Popen[bytes], timeout_seconds
     return True
 
 
+async def open_manual_auth_mode(data_root: PortableDataRoot, settings) -> None:
+    """UI setup: normal dedicated Chrome, no CDP/Playwright or credentials."""
+    conversation_url = settings.resolve_conversation_url()
+    with ReviewRelayProfileLock(data_root, settings.browser_profile) as lock:
+        process = launch_chrome(find_google_chrome(), lock.profile_path,
+                                mode=ChromeMode.AUTH, conversation_url=conversation_url)
+        # Owner closes Chrome normally, saving the exact tab for the accepted adapter.
+        while not await wait_for_chrome_exit(process, timeout_seconds=0.25):
+            await asyncio.sleep(0.1)
+
+
 async def request_chrome_shutdown(process: subprocess.Popen[bytes], timeout_seconds: float = 5) -> bool:
     """Ask our isolated Chrome process group to close, without force-killing it."""
     if process.poll() is not None:

@@ -11,7 +11,7 @@ from .models import TaskRecord, TaskState, utc_now_iso
 from .storage import PortableDataRoot
 
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 
 class StateStore:
@@ -42,9 +42,13 @@ class StateStore:
             self._migrate_v3_to_v4()
         elif version == 3:
             self._migrate_v3_to_v4()
+        elif version == 4:
+            pass
         elif version != SCHEMA_VERSION:
             self._connection.close()
             raise SchemaVersionError(f"No migration path from database version {version}")
+        if version in {1, 2, 3, 4}:
+            self._migrate_v4_to_v5()
 
     def _create_current_schema(self) -> None:
         allowed_states = ", ".join(f"'{state.value}'" for state in TaskState)
@@ -79,6 +83,7 @@ class StateStore:
             self._connection.execute("CREATE UNIQUE INDEX worker_thread_identity ON tasks(worker_thread_id) WHERE worker_thread_id IS NOT NULL")
             self._connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
             self._github_tables()
+            self._project_tables()
 
     def _migrate_v1_to_v2(self) -> None:
         """Add the two Phase 2 counters without rewriting Phase 1 task state."""
@@ -121,6 +126,20 @@ class StateStore:
             self._connection.execute("BEGIN IMMEDIATE")
             self._github_tables()
             self._connection.execute("PRAGMA user_version = 4")
+
+    def _project_tables(self) -> None:
+        self._connection.execute("""CREATE TABLE projects (
+            project_id TEXT PRIMARY KEY, local_identity TEXT NOT NULL UNIQUE,
+            github_identity TEXT UNIQUE, record_json TEXT NOT NULL)""")
+        self._connection.execute("""CREATE TABLE project_events (
+            sequence INTEGER PRIMARY KEY AUTOINCREMENT, project_id TEXT NOT NULL,
+            kind TEXT NOT NULL, payload_json TEXT NOT NULL, created_at TEXT NOT NULL)""")
+
+    def _migrate_v4_to_v5(self) -> None:
+        with self._connection:
+            self._connection.execute("BEGIN IMMEDIATE")
+            self._project_tables()
+            self._connection.execute("PRAGMA user_version = 5")
 
     def save(self, record: TaskRecord) -> None:
         validate_identifier(record.project_id, "project_id")

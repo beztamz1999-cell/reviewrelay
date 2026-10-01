@@ -1,10 +1,10 @@
 # ReviewRelay
 
-ReviewRelay is a small standalone foundation for relaying implementation work to human or AI reviewers. **Local Git is execution truth; GitHub is the reviewer-readable mirror.** `SPEC.md` is the canonical product specification.
+ReviewRelay is a small standalone foundation for relaying implementation work to human or AI reviewers. **Project first: one Project binds one local repository to one GitHub repository and supports N Tasks. Local Git is execution truth; GitHub is the reviewer-readable mirror.** `SPEC.md` is the canonical product specification.
 
 ## Status
 
-Phases 1–6 are implemented as explicit components. Phase 3 provides the ChatGPT web transport; Phase 4 provides a separately invoked Codex app-server worker adapter; Phase 5 is the Local Verification Executor; Phase 6 publishes verified candidates and sends compact GitHub review notifications. No autonomous controller or Phase 7 is implemented. Live smoke procedures are explicit development tools and are not part of automated tests.
+Phases 1–6 are implemented as explicit components. Phase 3 provides the ChatGPT web transport; Phase 4 provides a separately invoked Codex app-server worker adapter; Phase 5 is the Local Verification Executor; Phase 6 provides the persistent Project registry, repository setup, minimal PySide6 Project Hub and the GitHub candidate/review bridge. No autonomous controller or Phase 7 is implemented. Live smoke procedures are explicit development tools and are not part of automated tests.
 
 Normal source review uploads no patch, worker report, implementation report, audit report or source snapshots. Historical reports and attachment/evidence APIs remain available for compatibility and explicit local diagnostics; they are not prerequisites or automatic fallbacks for GitHub review. New tasks share one committed `.reviewrelay/tasks/<TASK_ID>.md`, not generated narrative reports.
 
@@ -15,12 +15,48 @@ Requires Python 3.11 or newer (including Python 3.14), Git, and the project depe
 ```powershell
 py -m venv .venv
 .\.venv\Scripts\Activate.ps1
-python -m pip install -e ".[dev,browser]"
+python -m pip install -e ".[dev,browser,ui]"
 python -m playwright install chromium
 python -m pytest
 ```
 
 The full test suite can also be run with `python -m pytest -q`. Source compilation can be checked with `python -m compileall -q src tests`.
+
+## Phase 6 Project Hub and setup
+
+Launch the Project Hub using an explicit portable data folder, kept separate from source repositories:
+
+```powershell
+python -m reviewrelay.ui --data-root "G:\REVIEW_RELAY_DATA"
+```
+
+The installed `reviewrelay` command opens the same UI. Without `--data-root`, it asks the Owner to select the portable folder. The optional `ui` dependency supplies PySide6; `dev` includes it for UI regression tests. GitHub setup requires installed, authenticated official `gh` tooling. ReviewRelay neither installs/authenticates it nor reads its credential files. Missing tooling returns `GITHUB_TOOLING_REQUIRED`; missing authentication returns `GITHUB_AUTH_REQUIRED`.
+
+The setup order is **Create/Import → Local Git → Create/Link/Detect GitHub → Verify repository pair → Reviewer + Codex runtime → PROJECT_READY**. Reviewer and worker controls stay disabled until the repository layer is verified. The Hub shows each component's typed status, canonical GitHub URL, history relationship and any setup error. Git/GitHub/browser checks run outside the UI thread; busy controls prevent duplicate effects. The window cannot close while a setup job is running.
+
+### New Project
+
+Choose **New Project**, enter name/folder/initial branch, then choose **Create GitHub Repository** or **Link Existing GitHub Repository**. A genuinely empty folder gets a Git repository and an empty initialization commit, with no fabricated application source. Populated folders must use the Existing flow. Creation requires an explicit PRIVATE/PUBLIC choice; PUBLIC requires **Confirm Public Repository** before creation/publication. The setup service publishes an immutable initial SHA without force and verifies the remote SHA before marking the repository layer ready.
+
+### Existing Project
+
+Choose **Existing Project** and select the repository root. Discovery does not silently initialize, stage, commit or bind a remote. Detected HTTPS and SSH GitHub remotes are normalized and offered as **Use This Repository** or **Choose Another Repository**. Without a usable remote, choose Create or Link. A populated non-Git folder needs explicit Git initialization, then a preview of candidate and ignored paths and **Create Initial Git Snapshot** confirmation. Changes after preview invalidate the snapshot. Existing staged content requires Owner resolution.
+
+Setup distinguishes empty, matching, local-ahead, remote-ahead, divergent and unrelated history. Empty/local-ahead initial publication uses a normal push; remote-ahead binding can be verified without modifying local history and is displayed as such. Divergence/unrelated history stops with typed errors. No automatic force push, merge, rebase or reset runs. Choosing another repository never overwrites a conflicting existing remote. Rechecking a verified binding only reads GitHub/Git state; it does not publish a later Task candidate onto the default branch.
+
+Before initial PUBLIC publication, a basic guard checks tracked paths in reachable history for `.env`, `.env.*`, key/credential names and explicitly configured sensitive paths. `PUBLICATION_RISK_REQUIRES_OWNER` stops publication. This checks paths, not secret contents; it is not comprehensive secret scanning or proof that publishing is safe.
+
+### Reviewer, worker and identity
+
+After GitHub verification, bind one existing ChatGPT conversation to the Project. **Open Manual Auth Chrome** uses the accepted dedicated profile in normal Auth Mode; the Owner opens/signs in manually and exits Chrome. A separate readiness check attaches through the existing Phase 3 adapter and checks the exact configured conversation without sending a message. No per-Task profile, default Chrome profile, raw cookie/token handling or credential automation is introduced.
+
+Select a Codex executable explicitly and optionally set model/reasoning defaults. Local version, app-server/stdio capability and supported login-status checks validate the runtime without inference or thread creation. This does not prove live access to a selected model. Each unrelated Task owns its own Codex thread; FIX_REQUIRED resumes that Task's thread. Project records contain no permanent thread ID, candidate SHA or review cycle.
+
+`ProjectRegistry` stores stable IDs and component configuration in the existing `db/relay.db`. Schema 5 adds Projects/events and migrates Phase 5 schema 3 and bridge schema 4 without losing prior task/worker/publication/review records. Historical configurations are preserved; they are not silently converted into ready Project registrations. Resolved local paths and canonical GitHub owner/repo identities are unique. Rename preserves identity and Task bindings. **Unregister** requires confirmation and removes only registration; local source, `.git`, GitHub and task history remain.
+
+`ProjectSetupService` journals intended repository creation, remote addition and initial push under an OS Project lock. Restart uses exact-identity discovery and read-only reconciliation; ambiguous effects require Owner intervention rather than duplicate creation or blind retry. Registered Tasks must use their ready Project configuration. The existing publisher verifies Task candidates and uses the Project's GitHub binding; compact notifications include Project ID/name and canonical repository/PR URLs, with no source/report/patch attachments.
+
+Run the foundation tests with `python -m pytest -q tests/test_projects.py tests/test_project_ui.py`. The required local end-to-end smoke creates an empty Project, initializes Git, binds a fake GitHub service backed by a real bare remote, verifies initial SHA, connects fake reviewer/runtime services, publishes a Task candidate and verifies its exact remote SHA and zero-attachment notification. Qt tests check choices, readiness, typed errors, busy guards and responsiveness. These offline results do not establish live GitHub/ChatGPT access. `LIVE_GITHUB_PROJECT_CREATE=NOT_RUN`: this host has no authorized destination and no installed `gh`. This phase implements setup only; there is no New Task orchestration UI or autonomous loop.
 
 ## Phase 1 scope
 
@@ -76,13 +112,13 @@ The smoke prints the raw response and requires the new owned response to contain
 
 ## Deferred scope
 
-Autonomous review loop, secret scanner, Windows UI, cloud service, arbitrary reviewer-driven shell execution, and production/release logic remain deferred. Configured test commands are executed only when a validated Phase 2 `test_id` selects them during local evidence collection.
+Autonomous review loop, comprehensive secret scanner, task execution/timeline UI, browser dock, packaging, cloud service, arbitrary reviewer-driven shell execution, and production/release logic remain deferred. The minimal Project Hub/setup UI is implemented. Configured test commands are executed only when a validated Phase 2 `test_id` selects them during local evidence collection.
 
 ## Phase 4 worker adapter
 
 `WorkerAdapter` is an async boundary. `CodexAppServerAdapter` launches `codex app-server --listen stdio://` directly with separate pipes, performs `initialize` / `initialized`, and creates or resumes a persistent Codex thread. Call Phase 1 `begin_task` before `start_task`. Supply exactly one prompt text or prompt file; call `wait_until_done` and `get_final_response` to capture the completed response. `send_instruction` continues the saved thread, and a new adapter uses `resume_task` after restart. Always await `close` in a `finally` block.
 
-SQLite schema 4 preserves the Phase 4 task/repository/Codex-thread bindings and adds Phase 6 publication, event and review tables. A task lock prevents concurrent worker adapters. Only `turn/completed` with `completed` status is transport success. Failed, interrupted, timeout, dead-process, and malformed-protocol outcomes have typed errors; no replacement thread or exec fallback is created automatically. Final responses remain untrusted narrative; `TaskStorage.persist_worker_report` is retained for compatibility, with no required per-task implementation/audit report in the normal GitHub flow.
+SQLite schema 5 preserves the Phase 4 task/repository/Codex-thread bindings, bridge publication/review tables and adds Project registration/setup events. A task lock prevents concurrent worker adapters. Only `turn/completed` with `completed` status is transport success. Failed, interrupted, timeout, dead-process, and malformed-protocol outcomes have typed errors; no replacement thread or exec fallback is created automatically. Final responses remain untrusted narrative; `TaskStorage.persist_worker_report` is retained for compatibility, with no required per-task implementation/audit report in the normal GitHub flow.
 
 Optional `worker` configuration supports `executable`, `model`, `reasoning_effort`, `sandbox` (`workspace-write` or `read-only`), and `timeouts` (`startup_seconds`, `initialize_seconds`, `request_seconds`, `idle_seconds`, `overall_seconds`, `shutdown_seconds`). Omitted model/effort use Codex configuration. Existing local Codex login is reused through Codex itself; ReviewRelay does not read credential files. Interactive server requests stop with a typed error for caller handling.
 
@@ -122,7 +158,7 @@ github:
   mode: pr
 ```
 
-Use an Owner-authorized named remote. Production supports credential-free `https://github.com/owner/repository.git` or `git@github.com:owner/repository.git`. Reuse supported local Git authentication; missing authentication stops with `GITHUB_AUTH_REQUIRED`. Tokens are not configuration fields. PR mode additionally requires the optional official `gh` CLI and its supported local authentication; branch mode does not. Private-repository access from the ChatGPT account is an Owner prerequisite: ReviewRelay never copies credentials into ChatGPT. An inaccessible candidate must produce `REVIEW_ERROR` with reason `GITHUB_REVIEW_ACCESS_REQUIRED`; no attachment fallback runs automatically.
+Use a Project's verified named remote. Production supports credential-free `https://github.com/owner/repository.git`, `git@github.com:owner/repository.git` or `ssh://git@github.com/owner/repository.git`. Reuse supported local Git authentication; missing authentication stops with `GITHUB_AUTH_REQUIRED`. Tokens are not configuration fields. Project setup/metadata and PR mode require the official `gh` CLI and its supported local authentication; the branch publisher itself uses Git. Private-repository access from the ChatGPT account is an Owner prerequisite: ReviewRelay never copies credentials into ChatGPT. An inaccessible candidate must produce `REVIEW_ERROR` with reason `GITHUB_REVIEW_ACCESS_REQUIRED`; no attachment fallback runs automatically.
 
 The explicit caller flow is:
 

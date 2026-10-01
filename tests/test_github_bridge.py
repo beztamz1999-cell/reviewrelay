@@ -416,7 +416,7 @@ def test_schema3_upgrade_preserves_task_rows_and_rolls_back_on_failure(setup, mo
     root, _, _, _, _, _, _ = setup
     with StateStore(root) as state:
         before = state.get("p", "task")
-        for table in ("github_publications", "github_events", "github_reviews"):
+        for table in ("github_publications", "github_events", "github_reviews", "projects", "project_events"):
             state._connection.execute(f"DROP TABLE {table}")
         state._connection.execute("PRAGMA user_version=3")
         state._connection.commit()
@@ -433,7 +433,7 @@ def test_schema3_upgrade_preserves_task_rows_and_rolls_back_on_failure(setup, mo
         assert not db.execute("SELECT name FROM sqlite_master WHERE name='github_publications'").fetchall()
     with StateStore(root) as state:
         assert state.get("p", "task") == before
-        assert state._connection.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION == 4
+        assert state._connection.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION == 5
 
 
 def test_github_configuration_roundtrip_and_no_token_field():

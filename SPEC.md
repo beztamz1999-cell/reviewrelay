@@ -9,11 +9,15 @@
 
 ## 0. Owner-Approved Architecture Revision — 2026-10-01
 
-This Phase 6 revision governs current source review and supersedes earlier attachment-first defaults and the original phase roadmap below. Historical reports describe their accepted phases; they are not new-task deliverable requirements.
+This Phase 6 Project + GitHub Foundation revision governs setup and source review, extending the accepted GitHub bridge and superseding earlier attachment-first defaults and the original phase roadmap below. Historical reports describe their accepted phases; they are not new-task deliverable requirements.
 
 ```text
 LOCAL = execution truth
 GITHUB = reviewer-readable mirror
+
+Project = one resolved local repository + one canonical GitHub repository + N Tasks
+Create/Import → Local Git → GitHub create/link/detect → verified repository pair
+→ ChatGPT reviewer + Codex runtime → PROJECT_READY → Tasks later
 
 Committed task spec → Codex implementation + tests + local commit
 → Relay verifies exact clean candidate
@@ -42,7 +46,7 @@ github:
   mode: pr  # branch also supported; default mode is branch
 ```
 
-The named remote must resolve to exactly one credential-free supported GitHub destination: HTTPS on `github.com` or `git@github.com:owner/repository.git`. Reuse supported local Git authentication; unavailable authentication returns `GITHUB_AUTH_REQUIRED`. Never store tokens in configuration or copy credentials into ChatGPT. PR mode uses optional official GitHub CLI tooling; missing `gh` returns `GITHUB_CLI_UNAVAILABLE`. Branch mode uses Git alone. Other Git hosts/enterprise endpoints are outside this implementation. Local bare remotes are permitted only by an explicit offline test seam, disabled in production.
+The named remote must resolve to exactly one credential-free supported GitHub destination: HTTPS on `github.com`, `git@github.com:owner/repository.git` or `ssh://git@github.com/owner/repository.git` (default SSH port or 22). Reuse supported local Git authentication; unavailable authentication returns `GITHUB_AUTH_REQUIRED`. Never store tokens in configuration or copy credentials into ChatGPT. Project setup uses official GitHub CLI tooling; missing `gh` returns `GITHUB_TOOLING_REQUIRED`. The existing PR service retains `GITHUB_CLI_UNAVAILABLE` for its missing-tool condition. The branch publisher itself uses Git alone. Other Git hosts/enterprise endpoints are outside this implementation. Local bare remotes are permitted only by an explicit offline test seam, disabled in production.
 
 One deterministic `reviewrelay/<sanitized-task>-<digest>` branch belongs to each task, with a suffix to distinguish sanitized IDs. Fix commits advance that same branch without force. Before every push, require valid local repository, actual HEAD equal to the exact committed candidate, clean worktree, current task/cycle/config/spec bindings, and ancestor relationships. Push a fixed `<candidate_sha>:refs/heads/<task_branch>` refspec; disable automatic tag/submodule pushes. Never push a moving HEAD or rewrite unexpected remote history. Divergence returns `GITHUB_BRANCH_DIVERGED`.
 
@@ -50,7 +54,7 @@ Git/gh use fixed argv with no shell, bounded process lifetime and output, nonint
 
 ### 0.3 Durable effects and recovery
 
-SQLite schema 4 migrates the existing `db/relay.db`, retaining Phase 1–5 task/worker state and adding `github_publications`, `github_events`, `github_reviews`. Persist remote, base branch, task branch, PR identity, last local/remote SHAs, publish status/time, spec binding, review cycle, notification identity, raw response and parsed decision. Migration and publication checkpoints are transactional. Per-task OS locks serialize publishing and review bridge operations.
+SQLite schema 5 migrates the existing `db/relay.db`, retaining Phase 1–5 task/worker state and schema-4 `github_publications`, `github_events`, `github_reviews`, and adding `projects` and `project_events`. Persist remote, base branch, task branch, PR identity, last local/remote SHAs, publish status/time, spec binding, review cycle, notification identity, raw response and parsed decision at Task scope. Migration and publication checkpoints are transactional. Per-task OS locks serialize publishing and review bridge operations; per-Project OS locks serialize setup, rename and unregister.
 
 ```text
 LOCAL_CANDIDATE_READY → GITHUB_PUSH_PLANNED → GITHUB_PUSH_IN_FLIGHT
@@ -65,7 +69,11 @@ Normalized events include `CANDIDATE_READY`, `GITHUB_PUSH_STARTED`, `GITHUB_PUSH
 
 ```text
 REVIEWRELAY_REVIEW_REQUEST
+PROJECT_ID=<stable Project ID>
+PROJECT_NAME=<display name at task binding>
 TASK_ID=<task>
+REPO_URL=<canonical GitHub web URL>
+PR_URL=<canonical URL or NONE>
 REPO=<owner/repository>
 PR=<canonical URL or NONE>
 BRANCH=<task branch>
@@ -85,15 +93,47 @@ Phase 5 is the **Local Verification Executor**; the public `LocalEvidenceExecuto
 
 Live browser behavior remains centralized in the accepted Phase 3 backend: dedicated installed-Chrome profile, manual Auth Mode without CDP/Playwright, clean close, Automation Mode with localhost-only CDP, and reuse of the exact restored reviewer tab without programmatic navigation. No default Chrome profile, cookie/token extraction or injection, credential automation, auth bypass, private endpoint or alternate reviewer conversation. Offline fixtures retain Playwright Chromium.
 
+Project connection regression exposed a restored-tab polling race: a loading status can disappear between visibility and text reads. Bound that individual text read to 250 ms so the readiness loop can poll again within its existing deadline. Preserve the existing hydration/stability and Owner-draft/send guards. A deterministic disappearing-status regression fails with the prior unbounded read and passes with the fix, retaining the Owner attachment and zero send clicks; no live-message test is required for Project setup.
+
 ### 0.6 Acceptance and development workflow
 
-Offline tests use actual local bare Git remotes with fake PR/reviewer services, covering safe task branches, exact immutable push, remote/PR HEAD verification, no force/shell, idempotency, planned/in-flight/lost-ack recovery, read-only reconciliation, one PR, spec mutation, dirty/mutated/divergent candidates, bounded errors/auth failures, schema migration/restart, compact zero-attachment notifications, owned raw responses and stale-decision rejection. Preserve Phase 1–5 regression; the old schema-2 migration fixture now removes schema-4 tables when constructing its historical database.
+Offline tests use actual local bare Git remotes with fake GitHub/PR/reviewer/runtime services, covering Project CRUD/identity/readiness, explicit New/Existing setup, snapshot confirmation/mutation, HTTPS/SSH detection, public confirmation/path risks, all history relationships, setup crash reconciliation, selected runtime checks without inference, exact task publishing and zero-attachment notifications. Real offscreen Qt tests check choices, gated controls, typed status/errors, unregister confirmation, busy guards and responsiveness. Existing bridge tests retain immutable push/PR verification, no force/shell, spec mutation, ownership and stale-decision coverage. Migration tests preserve Phase 5 schema-3 Task/worker rows and bridge schema-4 publication/review/event rows, including atomic rollback. Historical migration fixtures remove newer tables before reconstructing old schema versions.
 
 Required order: implementation → targeted tests → full regression → canonical docs → stage exact candidate → final full regression → compileall → staged/working diff checks → one local commit → clean worktree. Commands: `python -m pytest -q`, `python -m compileall -q src tests`, `git diff --check`, `git diff --cached --check`. No report-only follow-up commit.
 
-Live GitHub and reviewer-access smokes are optional, requiring an already Owner-authorized test destination. This development repository has no configured remote, so both are `NOT_RUN`; offline results do not prove live GitHub or ChatGPT connector access. No development-repository push, guessed destination or new authentication is authorized by this phase. Phase 7 needs a separate Owner-approved task.
+The required local end-to-end smoke creates an empty New Project and empty Git commit, binds a fake PRIVATE GitHub repository backed by an actual local bare remote, pushes/verifies the initial SHA, connects fake reviewer/runtime services and reaches PROJECT_READY. It then commits the canonical Task spec, begins a separate Task, publishes its candidate to the deterministic Task branch and verifies LOCAL_SHA == REMOTE_SHA plus a compact notification with empty attachments. Offline results do not prove live GitHub or ChatGPT connector access. Live GitHub creation requires an already Owner-authorized destination; this development repository has none and `gh` is absent, so `LIVE_GITHUB_PROJECT_CREATE=NOT_RUN`. No development-repository push, guessed destination or new authentication is authorized by this phase. Phase 7 needs a separate Owner-approved task.
 
-Official CLI references: [PR discovery](https://cli.github.com/manual/gh_pr_list), [explicit-head draft PR creation](https://cli.github.com/manual/gh_pr_create). See `README.md` for caller composition and `.reviewrelay/tasks/REVIEWRELAY_V1_PHASE6_GITHUB_BRIDGE.md` for this development task's scope.
+Official references: [repository creation](https://cli.github.com/manual/gh_repo_create), [repository metadata](https://cli.github.com/manual/gh_repo_view), [PR discovery](https://cli.github.com/manual/gh_pr_list), [explicit-head draft PR creation](https://cli.github.com/manual/gh_pr_create), [Qt worker thread pool](https://doc.qt.io/qtforpython-6/PySide6/QtCore/QThreadPool.html). See `README.md` for UI/caller composition and `.reviewrelay/tasks/REVIEWRELAY_V1_PHASE6_PROJECT_GITHUB_FOUNDATION.md` for this development task's scope. The earlier bridge task spec is retained as history.
+
+### 0.7 Persistent Project identity and readiness
+
+`ProjectRegistry` persists stable Project IDs, renameable display names, resolved local root, canonical GitHub owner/repo/web URL, named Git remote, visibility/default branch/verification time, review mode, reviewer URL/settings, worker runtime settings, typed component statuses and setup journal. Unique indexes prevent two active registrations of the same resolved local path or case-normalized GitHub identity. Local source and portable data roots must not overlap. Rename preserves IDs, repository binding and Task state. Unregister requires explicit confirmation and removes only registration; source, `.git`, GitHub repositories and historical Task/event rows are preserved. Removed Project registrations invalidate their previously bound publication flow.
+
+Project records do not own permanent Codex threads or mutable Task spec/branch/candidate/cycle/review state. Each unrelated Task owns its own thread; fixes resume that Task's saved thread using accepted Phase 4 semantics. Schema migration preserves legacy configurations and Tasks without manufacturing ready Project registrations or inferring Project identity from old worker threads. Explicit import is the supported registration path.
+
+Statuses are backend enums: NOT_CONFIGURED, SETTING_UP, READY, NEEDS_OWNER, ERROR. Repository readiness requires verified local/GitHub statuses, canonical URL and verification time. PROJECT_READY additionally requires ready reviewer/runtime statuses, a configured conversation URL and selected executable. Readiness represents the latest successful checks, not continuous proof of external authentication or model access. Registered `begin_task` and candidate publishing require ready Project configuration and matching bindings. Legacy unregistered component APIs remain compatible; the Hub does not use them to bypass Project setup.
+
+### 0.8 Local setup, GitHub effects and safety
+
+The first UI choice is explicitly NEW or EXISTING. NEW collects name, folder, initial branch and Create/Link GitHub choice. It initializes only an empty source folder and creates an empty initialization commit; it does not generate fake application files. EXISTING inspects the selected Git root. Existing Git history is preserved; detected supported remotes are proposals requiring Use This Repository or Choose Another Repository confirmation. No usable remote offers Create or Link. A populated non-Git directory requires explicit initialization followed by an inventory of candidate/ignored paths and Create Initial Git Snapshot confirmation before staging/committing. Preview changes, pre-existing staged content, unsafe paths or inventory limits stop the snapshot. No automatic source deletion, reset or rollback of Owner files is performed.
+
+Creation requires explicit PRIVATE/PUBLIC visibility. PUBLIC needs explicit confirmation before repository creation or initial push. A basic exposure guard inspects tracked paths in reachable history, including previously deleted paths, for `.env`, `.env.*`, private key/credential filenames and known configured sensitive paths. Detection stops with PUBLICATION_RISK_REQUIRES_OWNER. This is a path guard, not comprehensive content secret scanning or a guarantee of publication safety.
+
+`GitHubRepositoryCLI` uses bounded fixed-argv official `gh auth status`, repository metadata and exact owner/repo creation. It creates no guessed alternate repository names, exports no credentials and implicitly pushes no source. Link validates canonical GitHub identity and available metadata. Remote URLs must be credential-free; an existing remote with conflicting fetch/push destinations is not overwritten. Git operations disable interactive authentication and use generic diagnostics.
+
+Fetch HTTPS and push SSH may differ in spelling when both identify the same canonical repository. Reverification checks that identity and the exact persisted push transport; changed destinations invalidate readiness. Task binding also compares the actual publish remote against the registered Project before any remote read or push, preventing a changed remote from being accepted as a new Task destination.
+
+Compare local and selected remote default-branch history: REMOTE_EMPTY, MATCHING, LOCAL_AHEAD, REMOTE_AHEAD, GITHUB_HISTORY_DIVERGED or GITHUB_HISTORY_UNRELATED. Missing branch counts as empty only when the repository has no remote heads. Empty/local-ahead initial setup can push the exact clean local SHA normally, then require remote SHA equality. Remote-ahead binding can verify related history without changing local source; the Hub displays the relationship. Conflict requires Owner resolution. No automatic force push, merge, rebase, reset or history rewrite is permitted.
+
+Persist intended owner/repo/visibility/remote/local SHA and branch before external effects. Journal repository creation, remote addition and initial push with planned/in-flight/confirmed or ambiguous states. Recovery discovers the exact repository/remote/SHA and reconciles read-only where possible. An uncertain effect without proof requires Owner intervention; never blindly recreate or repush. Recheck local/remote state immediately before and after a push. Once verified, Project binding rechecks are read-only and never publish a later Task HEAD onto the default branch.
+
+### 0.9 Project connection and UI boundaries
+
+GitHub verification precedes reviewer or Codex connection in backend and UI. Reviewer setup validates one existing conversation and uses the centralized Phase 3 adapter/profile architecture. The manual Auth button opens dedicated normal Chrome without CDP/Playwright; the Owner authenticates and exits normally, preserving the tab. A separate adapter readiness check uses the same dedicated profile and exact restored conversation without sending a message. No per-Task profile, credential automation or raw authentication material handling is introduced.
+
+Runtime setup requires explicit executable selection; no blind default PATH inference occurs. Resolve/validate the selected executable and perform bounded version, app-server/stdio capability and supported login-status checks. Store executable/model/reasoning defaults, without starting inference or creating a thread. Missing/incompatible executables or auth stop with typed errors. A local check does not prove live account access to the selected model.
+
+The PySide6 Hub supplies Project list/detail, component statuses, New/Existing setup dialogs, GitHub detected/Create/Link choices, visibility/public confirmation, snapshot preview, reviewer/runtime connection, inspect/rename and confirmed unregister. QRunnable/QThreadPool jobs keep Git/GitHub/browser work off the UI thread; busy controls reject duplicate clicks and closing the window during active setup. Errors show safe typed codes and useful explanations. Portable data-root selection is explicit. This UI has no task execution screen, docked browser, Codex event dashboard, review timeline or autonomous controller. Phase 7 task routing and later packaging require separate Owner scope.
 
 ---
 
@@ -106,7 +146,7 @@ ReviewRelay is a lightweight standalone tool that automates the review loop betw
 - **Local machine** — collects deterministic evidence from Git, source files, tests, and repository state.
 - **Human Owner** — starts tasks, handles escalations, and performs final freeze/release decisions.
 
-ReviewRelay is **not** an AI harness, agent manager, project manager, or autonomous software organization.
+ReviewRelay provides repository Project registration/setup, not a general planning or project-management system. It is not an AI harness, agent manager or autonomous software organization.
 
 Its purpose is narrow:
 
@@ -1450,6 +1490,8 @@ storage:
 
 V1 UI must remain lightweight.
 
+Phase 6 implements the minimal Project Hub/setup described in section 0.9. The task controls and activity view below remain a future product target.
+
 Recommended:
 
 ```text
@@ -1745,11 +1787,16 @@ Acceptance:
 - local/runtime facts are collected without consuming Codex quota;
 - Phase 6 preserves the complete Phase 5 interface and regression suite.
 
-### Phase 6 — GitHub Review Bridge
+### Phase 6 — Project + GitHub Foundation
 
 Implement:
 
 - exact clean local-candidate publisher and task-spec binding;
+- persistent Project registry in the existing SQLite database;
+- explicit New/Existing local setup and GitHub detect/create/link;
+- verified repository identity/history, visibility confirmation and basic exposure guard;
+- repository-first reviewer/runtime configuration and deterministic readiness;
+- minimal nonblocking PySide6 Project Hub/setup;
 - one safely named remote task branch and one optional draft PR;
 - exact remote/PR HEAD verification, no force push;
 - durable publication/notification events and read-only ambiguity recovery;
@@ -1759,33 +1806,31 @@ Implement:
 Acceptance:
 
 - offline bare-remote/fake-PR/fake-reviewer tests and Phase 1–5 regression pass;
+- Project model/setup/migration/UI tests and required local Project-to-Task smoke pass;
 - no duplicate uncertain pushes/PRs/notifications or stale decisions;
 - optional live gates use an authorized remote or remain NOT_RUN;
 - autonomous worker/fix/evidence routing is not implemented.
 
-### Phase 7 — Lightweight Windows UI + Packaging
+### Phase 7 — Autonomous Task Loop (Owner gate)
 
-Future roadmap only. Do not start without a separate Owner-approved task. Autonomous routing and secret-scanner scope also remain deferred to explicit Owner decisions.
+Future roadmap only. Do not start without a separate Owner-approved task. Phase 6 has implemented Project setup and publishing primitives; autonomous task routing, comprehensive secret scanning, full task UI and packaging remain deferred to explicit Owner decisions.
 
 Potential work:
 
-- project selector;
-- task state view;
-- logs;
-- Start/Pause/Stop;
-- Open Chat/Repo/Evidence;
-- first-run data-root selection;
-- Windows packaging.
+- Task creation/start from a ready Project and committed canonical spec;
+- explicit controller wiring of worker, exact publisher, reviewer and local verification;
+- same-Task thread/branch continuity and strict candidate/cycle guards;
+- durable recovery and Owner escalation, without autonomous release operations.
 
 Acceptance:
 
-- normal operation does not require terminal usage.
+- acceptance criteria must be supplied in the separate Phase 7 Owner task; none of this future routing is implemented by Phase 6.
 
 ---
 
 ## 52. V1 Acceptance Matrix
 
-This is a product target matrix, not a claim that every future capability is implemented. Phase 6 acceptance is defined in section 0.6 and the canonical task spec; controller, scanner and UI remain deferred.
+This is a product target matrix, not a claim that every future capability is implemented. Phase 6 acceptance is defined in sections 0.6–0.9 and the canonical task spec; autonomous controller, comprehensive scanner and full task UI remain deferred. Minimal Project Hub/setup is implemented.
 
 | Requirement | V1 Acceptance |
 |---|---|

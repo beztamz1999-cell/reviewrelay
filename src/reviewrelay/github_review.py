@@ -20,6 +20,9 @@ from .worker.lock import WorkerTaskLock
 
 def review_notification(candidate: PublishedCandidate) -> str:
     return ("REVIEWRELAY_REVIEW_REQUEST\n\n"
+        f"PROJECT_ID={candidate.project_id}\nPROJECT_NAME={candidate.project_name or candidate.project_id}\n"
+        f"REPO_URL={candidate.repository_url or ('https://github.com/' + candidate.repository if not candidate.repository.startswith('local/') else 'NONE')}\n"
+        f"PR_URL={candidate.pr_url or 'NONE'}\n"
         f"TASK_ID={candidate.task_id}\nREPO={candidate.repository}\nPR={candidate.pr_url or 'NONE'}\n"
         f"BRANCH={candidate.branch}\nBASE_SHA={candidate.base_sha}\nHEAD_SHA={candidate.head_sha}\n"
         f"REVIEW_CYCLE={candidate.review_cycle}\nTASK_SPEC_PATH={candidate.task_spec_path}\n\n"
@@ -117,7 +120,8 @@ class GitHubReviewBridge:
             if row["status"] not in {"CONFIRMED", "RESPONSE_RECEIVED", "VALIDATED"}:
                 raise GitHubPublishError("Notification cannot supply an applicable decision", code="REVIEW_NOTIFICATION_UNRESOLVED")
             metadata = json.loads(row["metadata_json"])
-            if metadata["candidate"] != asdict(candidate):
+            persisted_candidate = {"project_name": None, "repository_url": None, **metadata["candidate"]}
+            if persisted_candidate != asdict(candidate):
                 raise GitHubPublishError("Persisted notification is stale", code="STALE_REVIEW")
             raw = row["raw_text"]
             if raw is None:

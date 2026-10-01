@@ -432,6 +432,61 @@ def test_cdp_backend_waits_for_restored_ui_hydration_before_send(fixture_server,
     _run(run())
 
 
+def test_restored_loading_status_disappearing_during_read_does_not_overrun_readiness(fixture_server, tmp_path):
+    async def run():
+        from playwright.async_api import async_playwright
+
+        async with async_playwright() as manager:
+            browser = await manager.chromium.launch(headless=True)
+            page = await browser.new_page()
+            await page.goto(f"{fixture_server}c/test")
+            await page.evaluate("""() => {
+                const status = document.createElement('div');
+                status.id = 'vanishing-status'; status.role = 'status';
+                status.textContent = 'Loading older messages…';
+                document.body.append(status);
+                const draft = document.createElement('div');
+                draft.dataset.testid = 'attachment-chip'; draft.textContent = 'owner-draft.txt';
+                document.querySelector('#attachments').append(draft);
+            }""")
+
+            class VanishingStatus:
+                async def is_visible(self):
+                    return await page.locator("#vanishing-status").is_visible()
+
+                async def inner_text(self, **kwargs):
+                    await page.evaluate("document.querySelector('#vanishing-status').remove()")
+                    return await page.locator("#vanishing-status").inner_text(**kwargs)
+
+            class StatusList:
+                async def count(self):
+                    return await page.locator("#vanishing-status").count()
+
+                def nth(self, index):
+                    return VanishingStatus()
+
+            class PageWithStatusRace:
+                def locator(self, selector):
+                    return StatusList() if selector == "[role='status']" else page.locator(selector)
+
+                def __getattr__(self, name):
+                    return getattr(page, name)
+
+            adapter = ChatGPTWebAdapter(tmp_path / "status-race", ChatGPTWebSettings(
+                base_url=fixture_server, conversation_url=f"{fixture_server}c/test", headless=False,
+                browser_backend=BrowserBackend.GOOGLE_CHROME_CDP,
+                timeouts=ChatGPTTimeouts(navigation_seconds=5)))
+            adapter._page = PageWithStatusRace()
+            try:
+                await asyncio.wait_for(adapter._wait_for_live_ui_ready(), timeout=4)
+                assert await adapter._visible_attachment_names() == ["owner-draft.txt"]
+                assert await page.evaluate("window.sendClicks") == 0
+            finally:
+                await browser.close()
+
+    _run(run())
+
+
 def test_lazy_file_input_is_waited_for_after_add_files_menu(fixture_server, tmp_path):
     async def run():
         data = PortableDataRoot(tmp_path / "lazy-upload").create()

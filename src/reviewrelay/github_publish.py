@@ -9,13 +9,13 @@ import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Protocol
-from urllib.parse import urlsplit
 
 from .config import ProjectConfig, validate_branch_name, validate_identifier
 from .errors import CandidateInvalidDirtyWorktree, CandidateMutatedDuringReview, ReviewRelayError
 from .evidence_process import run_bounded
 from .git import GitClient
 from .models import utc_now_iso
+from .projects import Project, ProjectError, github_identity
 from .state import StateStore
 from .storage import PortableDataRoot, TaskStorage
 from .worker.lock import WorkerTaskLock
@@ -81,6 +81,8 @@ class PublishedCandidate:
     task_spec_path: str
     pr_url: str | None = None
     pr_number: int | None = None
+    project_name: str | None = None
+    repository_url: str | None = None
 
 
 class CandidatePublisher(Protocol):
@@ -182,22 +184,39 @@ class GitHubCandidatePublisher:
         if len(urls) != 1:
             raise GitHubPublishError("Exactly one publish destination is required", code="GITHUB_REMOTE_INVALID")
         url = urls[0]
-        match = re.fullmatch(r"git@github\.com:([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+?)(?:\.git)?", url)
-        if match:
-            return url, match[1]
+        project = self._project()
         try:
-            parts = urlsplit(url)
-            port = parts.port
-        except ValueError:
-            raise GitHubPublishError("Malformed publish destination", code="GITHUB_REMOTE_INVALID") from None
-        if parts.scheme == "https" and parts.hostname == "github.com" and not parts.username and not parts.password and not parts.query and not parts.fragment and port is None:
-            match = re.fullmatch(r"/([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+?)(?:\.git)?", parts.path)
-            if match:
-                return url, match[1]
+            identity = github_identity(url)
+            if project and identity.key != github_identity(project.github_repo_url).key:
+                raise GitHubPublishError("Publish destination differs from its Project", code="GITHUB_BINDING_MISMATCH")
+            return url, f"{identity.owner}/{identity.name}"
+        except ProjectError:
+            pass
         if self.allow_local_remote and Path(url).is_dir() and self.config.github.mode == "branch":
             checked = Path(url).resolve()
+            if project:
+                if str(checked) != project.github_git_url:
+                    raise GitHubPublishError("Publish destination differs from its Project", code="GITHUB_BINDING_MISMATCH")
+                return str(checked), f"{project.github_owner}/{project.github_repo_name}"
             return str(checked), f"local/{checked.name}"
         raise GitHubPublishError("Publish remote must be a credential-free supported GitHub URL", code="GITHUB_REMOTE_INVALID")
+
+    def _project(self):
+        row = self.state._connection.execute("SELECT record_json FROM projects WHERE project_id=?", (self.config.project_id,)).fetchone()
+        return Project.from_json(row[0]) if row else None
+
+    def _verify_project(self, row=None):
+        project = self._project()
+        if row and row["metadata"].get("registered_project") and project is None:
+            raise GitHubPublishError("Project registration was removed", code="PROJECT_NOT_FOUND")
+        if project:
+            expected = project.to_config()
+            if (expected.github != self.config.github or expected.chatgpt != self.config.chatgpt
+                    or expected.worker != self.config.worker or Path(expected.repo.path).resolve() != Path(self.config.repo.path).resolve()):
+                raise GitHubPublishError("Task configuration differs from its Project", code="GITHUB_BINDING_MISMATCH")
+            if row and (row["metadata"].get("project_repository_url") != project.github_repo_url):
+                raise GitHubPublishError("Task Project binding changed", code="GITHUB_BINDING_MISMATCH")
+        return project
 
     async def _remote_sha(self, url, branch):
         ref = "refs/heads/" + branch
@@ -227,6 +246,7 @@ class GitHubCandidatePublisher:
         try:
             if self.load(task_id):
                 raise GitHubPublishError("Task is already bound", code="GITHUB_TASK_ALREADY_BOUND")
+            project = self._verify_project()
             r = self.state.get(self.config.project_id, task_id)
             if r is None or r.worker_thread_id or r.candidate_sha or r.review_cycle:
                 raise GitHubPublishError("Bind the task spec before implementation", code="TASK_SPEC_BINDING_REQUIRED")
@@ -240,12 +260,15 @@ class GitHubCandidatePublisher:
                 "github_base_branch": self.config.github.base_branch, "github_task_branch": task_branch_name(task_id),
                 "github_publish_status": "TASK_BOUND", "metadata": {"repo_path": str(Path(self.config.repo.path).resolve()),
                 "remote_url": url, "repository": repository, "mode": self.config.github.mode, "base_sha": r.base_sha,
-                "task_spec_path": path, "task_spec_blob": blob, "allow_spec_change": allow_spec_change}}
+                "task_spec_path": path, "task_spec_blob": blob, "allow_spec_change": allow_spec_change,
+                "registered_project": bool(project), "project_name": project.project_name if project else None,
+                "project_repository_url": project.github_repo_url if project else None}}
             self._save(row, "TASK_SPEC_BOUND")
         finally:
             lock.close()
 
     async def _validate(self, request, row):
+        self._verify_project(row)
         r = self.state.get(self.config.project_id, request.task_id)
         if (r is None or not row or r.base_sha != request.base_sha or r.candidate_sha != request.candidate_sha
                 or r.review_cycle != request.review_cycle or request.review_cycle < 1
@@ -270,7 +293,8 @@ class GitHubCandidatePublisher:
     def _candidate(self, request, row):
         return PublishedCandidate(self.config.project_id, request.task_id, row["metadata"]["repository"],
             row["github_task_branch"], request.base_sha, request.candidate_sha, request.review_cycle,
-            row["metadata"]["task_spec_path"], row.get("github_pr_url"), row.get("github_pr_number"))
+            row["metadata"]["task_spec_path"], row.get("github_pr_url"), row.get("github_pr_number"),
+            row["metadata"].get("project_name"), row["metadata"].get("project_repository_url"))
 
     async def _finish(self, request, row, *, allow_pr_creation=True):
         if self.config.github.mode == "pr":

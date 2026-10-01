@@ -461,7 +461,9 @@ class ChatGPTWebAdapter:
                     status = statuses.nth(index)
                     if not await status.is_visible():
                         continue
-                    label = (await status.inner_text()).strip().lower()
+                    # A loading status may disappear after is_visible(); keep polling
+                    # instead of waiting Playwright's default 30 seconds on a lost node.
+                    label = (await status.inner_text(timeout=250)).strip().lower()
                     if label.startswith(("loading conversation", "loading message", "loading older message")):
                         loading = True
                         break

@@ -628,16 +628,18 @@ def test_phase5_and_bridge_migration_preserves_tasks_and_publish_review_rows(set
         state.save(old)
         # A real Phase 5 schema has worker state but none of the later tables.
         db = state._connection
-        for name in ("projects", "project_events", "github_publications", "github_events", "github_reviews"):
+        for name in ("projects", "project_events", "github_publications", "github_events", "github_reviews", "controller_tasks", "controller_effects", "controller_reviews", "controller_events"):
             db.execute("DROP TABLE " + name)
         db.execute("PRAGMA user_version=3")
         db.commit()
     with StateStore(root) as state:
         assert state.get("legacy", "task") == old
-        assert state._connection.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION == 5
+        assert state._connection.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION == 6
         state._connection.execute("INSERT INTO github_events(project_id,task_id,kind,payload_json,created_at) VALUES('legacy','task','saved','{}','now')")
         state._connection.execute("INSERT INTO github_publications VALUES('legacy','task','origin','main','reviewrelay/task',NULL,NULL,?,?, 'READY_TO_NOTIFY_REVIEWER','now','{}')", (old.base_sha, old.base_sha))
         state._connection.execute("INSERT INTO github_reviews VALUES('kept-review','legacy','task',?,1,'VALIDATED','{}','owned raw response','{}','now')", (old.base_sha,))
+        for table in ("controller_tasks", "controller_effects", "controller_reviews", "controller_events"):
+            state._connection.execute("DROP TABLE " + table)
         state._connection.execute("DROP TABLE projects")
         state._connection.execute("DROP TABLE project_events")
         state._connection.execute("PRAGMA user_version=4")

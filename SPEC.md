@@ -7,9 +7,9 @@
 
 ---
 
-## 0. Owner-Approved Architecture Revision — 2026-10-01
+## 0. Owner-Approved Architecture Revision — 2026-10-02
 
-This Phase 6 Project + GitHub Foundation revision governs setup and source review, extending the accepted GitHub bridge and superseding earlier attachment-first defaults and the original phase roadmap below. Historical reports describe their accepted phases; they are not new-task deliverable requirements.
+The approved Phase 6 Project + GitHub Foundation and Phase 7 Autonomous Task Controller govern setup, source review and routing, superseding earlier attachment-first defaults and the original phase roadmap below. Historical reports describe their accepted phases; they are not new-task deliverable requirements. Phase 8 has not started.
 
 ```text
 LOCAL = execution truth
@@ -17,7 +17,7 @@ GITHUB = reviewer-readable mirror
 
 Project = one resolved local repository + one canonical GitHub repository + N Tasks
 Create/Import → Local Git → GitHub create/link/detect → verified repository pair
-→ ChatGPT reviewer + Codex runtime → PROJECT_READY → Tasks later
+→ ChatGPT reviewer + Codex runtime → PROJECT_READY → Create Task → Start
 
 Committed task spec → Codex implementation + tests + local commit
 → Relay verifies exact clean candidate
@@ -54,7 +54,7 @@ Git/gh use fixed argv with no shell, bounded process lifetime and output, nonint
 
 ### 0.3 Durable effects and recovery
 
-SQLite schema 5 migrates the existing `db/relay.db`, retaining Phase 1–5 task/worker state and schema-4 `github_publications`, `github_events`, `github_reviews`, and adding `projects` and `project_events`. Persist remote, base branch, task branch, PR identity, last local/remote SHAs, publish status/time, spec binding, review cycle, notification identity, raw response and parsed decision at Task scope. Migration and publication checkpoints are transactional. Per-task OS locks serialize publishing and review bridge operations; per-Project OS locks serialize setup, rename and unregister.
+SQLite schema 6 migrates the existing `db/relay.db`, retaining Phase 1–5 task/worker state, schema-4 `github_publications`, `github_events`, `github_reviews`, and Phase 6 `projects`/`project_events`. It adds `controller_tasks`, `controller_effects`, `controller_reviews` and `controller_events`. Persist remote, base branch, task branch, PR identity, last local/remote SHAs, publish status/time, spec binding, review cycle, notification identity, raw response and parsed decision at Task scope. Migration and publication checkpoints are transactional. Per-task OS locks serialize controller, worker and publication ownership; a per-Project OS lock serializes the autonomous run with setup, rename and unregister.
 
 ```text
 LOCAL_CANDIDATE_READY → GITHUB_PUSH_PLANNED → GITHUB_PUSH_IN_FLIGHT
@@ -89,7 +89,7 @@ ChatGPT inspects that exact commit, BASE..HEAD diff, related source and tests di
 
 ### 0.5 Local verification and current scope
 
-Phase 5 is the **Local Verification Executor**; the public `LocalEvidenceExecutor` name and all nine whitelisted DSL operations remain compatible. Use it for configured tests, Git status, runtime/environment outputs and generated-artifact verification that GitHub cannot supply reliably. Normal source retrieval occurs directly on GitHub. Phase 6 returns validated decisions only; it does not autonomously dispatch workers, fixes or evidence, mark release completion, merge, deploy, or start Phase 7.
+Phase 5 is the **Local Verification Executor**; the public `LocalEvidenceExecutor` name and all nine whitelisted DSL operations remain compatible. Use it for configured tests, Git status, runtime/environment outputs and generated-artifact verification that GitHub cannot supply reliably. Normal source retrieval occurs directly on GitHub. The standalone Phase 6 bridge returns validated decisions; Phase 7 routes them through the persisted controller. No component gains merge, deployment or release authority.
 
 Live browser behavior remains centralized in the accepted Phase 3 backend: dedicated installed-Chrome profile, manual Auth Mode without CDP/Playwright, clean close, Automation Mode with localhost-only CDP, and reuse of the exact restored reviewer tab without programmatic navigation. No default Chrome profile, cookie/token extraction or injection, credential automation, auth bypass, private endpoint or alternate reviewer conversation. Offline fixtures retain Playwright Chromium.
 
@@ -101,7 +101,7 @@ Offline tests use actual local bare Git remotes with fake GitHub/PR/reviewer/run
 
 Required order: implementation → targeted tests → full regression → canonical docs → stage exact candidate → final full regression → compileall → staged/working diff checks → one local commit → clean worktree. Commands: `python -m pytest -q`, `python -m compileall -q src tests`, `git diff --check`, `git diff --cached --check`. No report-only follow-up commit.
 
-The required local end-to-end smoke creates an empty New Project and empty Git commit, binds a fake PRIVATE GitHub repository backed by an actual local bare remote, pushes/verifies the initial SHA, connects fake reviewer/runtime services and reaches PROJECT_READY. It then commits the canonical Task spec, begins a separate Task, publishes its candidate to the deterministic Task branch and verifies LOCAL_SHA == REMOTE_SHA plus a compact notification with empty attachments. Offline results do not prove live GitHub or ChatGPT connector access. Live GitHub creation requires an already Owner-authorized destination; this development repository has none and `gh` is absent, so `LIVE_GITHUB_PROJECT_CREATE=NOT_RUN`. No development-repository push, guessed destination or new authentication is authorized by this phase. Phase 7 needs a separate Owner-approved task.
+The required Phase 6 local end-to-end smoke creates an empty New Project and empty Git commit, binds a fake PRIVATE GitHub repository backed by an actual local bare remote, pushes/verifies the initial SHA, connects fake reviewer/runtime services and reaches PROJECT_READY. It then commits the canonical Task spec, begins a separate Task, publishes its candidate to the deterministic Task branch and verifies LOCAL_SHA == REMOTE_SHA plus a compact notification with empty attachments. Offline results do not prove live GitHub or ChatGPT connector access. Live GitHub creation requires an already Owner-authorized destination; this development repository has none and `gh` is absent, so `LIVE_GITHUB_PROJECT_CREATE=NOT_RUN`. No development-repository push, guessed destination or new authentication is authorized. Phase 7 acceptance is defined below and in its approved canonical task spec.
 
 Official references: [repository creation](https://cli.github.com/manual/gh_repo_create), [repository metadata](https://cli.github.com/manual/gh_repo_view), [PR discovery](https://cli.github.com/manual/gh_pr_list), [explicit-head draft PR creation](https://cli.github.com/manual/gh_pr_create), [Qt worker thread pool](https://doc.qt.io/qtforpython-6/PySide6/QtCore/QThreadPool.html). See `README.md` for UI/caller composition and `.reviewrelay/tasks/REVIEWRELAY_V1_PHASE6_PROJECT_GITHUB_FOUNDATION.md` for this development task's scope. The earlier bridge task spec is retained as history.
 
@@ -133,7 +133,45 @@ GitHub verification precedes reviewer or Codex connection in backend and UI. Rev
 
 Runtime setup requires explicit executable selection; no blind default PATH inference occurs. Resolve/validate the selected executable and perform bounded version, app-server/stdio capability and supported login-status checks. Store executable/model/reasoning defaults, without starting inference or creating a thread. Missing/incompatible executables or auth stop with typed errors. A local check does not prove live account access to the selected model.
 
-The PySide6 Hub supplies Project list/detail, component statuses, New/Existing setup dialogs, GitHub detected/Create/Link choices, visibility/public confirmation, snapshot preview, reviewer/runtime connection, inspect/rename and confirmed unregister. QRunnable/QThreadPool jobs keep Git/GitHub/browser work off the UI thread; busy controls reject duplicate clicks and closing the window during active setup. Errors show safe typed codes and useful explanations. Portable data-root selection is explicit. This UI has no task execution screen, docked browser, Codex event dashboard, review timeline or autonomous controller. Phase 7 task routing and later packaging require separate Owner scope.
+The PySide6 Hub supplies Project list/detail, component statuses, New/Existing setup dialogs, GitHub detected/Create/Link choices, visibility/public confirmation, snapshot preview, reviewer/runtime connection, inspect/rename and confirmed unregister. QRunnable/QThreadPool jobs keep Git/GitHub/browser work off the UI thread; busy controls reject duplicate clicks and closing the window during active setup or Task jobs. Errors show safe typed codes and useful explanations. Portable data-root selection is explicit. A ready Project enables the Phase 7 Tasks window. Browser docking, advanced worker panels, polish and packaging remain deferred.
+
+### 0.10 Autonomous Task lifecycle and UI
+
+`TaskController.create_task` takes explicit ID/title/spec, creation-time spec-change/new-commit policy, fix/evidence limits and an optional Owner test registry. The UI intentionally commits only `.reviewrelay/tasks/<TASK_ID>.md` before any worker call, persists actual Git HEAD as baseline and binds the Phase 6 publisher. Dirty/unrelated changes or unsafe paths block creation. Spec commit recovery accepts only the exact intended single-parent/spec-only commit; it never guesses a baseline or duplicates a reconciled commit. The immutable default cannot be relaxed during a fix or restart.
+
+```text
+DRAFT → spec commit → READY → WORKER_RUNNING → VERIFYING_CANDIDATE
+→ PUBLISHING → WAITING_REVIEW → PROCESSING_REVIEW
+    PASS                    → COMPLETE / READY_FOR_OWNER_REVIEW=YES
+    FIX_REQUIRED            → WORKER_RUNNING → verify/publish/review next cycle
+    NEED_EVIDENCE           → COLLECTING_EVIDENCE → SENDING_EVIDENCE → review
+    OWNER_DECISION_REQUIRED → PAUSED_OWNER
+    REVIEW_ERROR            → PAUSED_ERROR
+User pause                  → PAUSED_USER → explicit Resume
+User stop                   → STOPPED
+```
+
+Initial execution creates one Task-owned Codex thread. Fixes use only the validated Phase 2 `worker_instruction` in a controller wrapper through `send_instruction` on that exact thread. A separate Task gets a separate thread. Completion must agree with Phase 4's durable thread/turn/app-server state. Independently verify the actual clean committed HEAD, ancestry and spec; normally require a new commit. Persist candidate, thread/turn and timestamp, increment review cycle and publish through the accepted Phase 6 publisher. Keep the same remote branch and optional canonical PR across fixes. Require remote equality before every reviewer notification and before routing a decision.
+
+The controller uses Phase 3 owned send/completion/raw extraction and Phase 2 validation exclusively. Ordinary notifications contain the compact GitHub contract and zero attachments. Raw response, response identity and parsed candidate/cycle-bound decision are durable before routing. PASS rechecks local/remote/clean identity and means review-loop completion only; it does not merge, push main, tag, deploy, release or authorize Phase 8.
+
+NEED_EVIDENCE invokes only the Phase 5 executor; worker call count does not increase. A complete stable batch with manifest hashes yields deterministic JSON-quoted textual evidence, bounded to 16 KiB per artifact and 48 KiB combined. TEST_FAIL is valid evidence. Unsafe/incomplete/binary/oversized evidence pauses; this controller has no automatic exceptional-attachment fallback. Source reads remain compatible DSL operations, while GitHub remains normal source review.
+
+OWNER_DECISION_REQUIRED persists reviewer reason/context and makes no further model call until explicit `resume_with_owner_decision`. Owner text and timestamp are retained and clearly identified in a continuation to the reviewer for the same candidate; arbitrary Owner text is never dispatched as a worker command. REVIEW_ERROR and invalid/stale responses pause without worker changes. Fix/evidence limits (defaults 3/5) are checked before the next effect; escalation pauses for Owner resolution, without another call or an Owner-text bypass of the limit.
+
+Task detail shows canonical spec, branch, baseline/candidate/remote SHAs, thread/component states, PR, cycles, call counters, final state and a merged persisted controller/Phase 6 publication timeline. Only normalized observable command/file/tool/lifecycle events are copied from the bounded worker timeline; reasoning is excluded. New Task/Start/Pause/Resume/Stop/Owner Decision use background jobs, duplicate-dispatch guards and explicit backend state. Pause is cooperative at a safe checkpoint; Stop requests interruption of active waits and prevents subsequent effects. Closed windows restart their refresh timer when reopened.
+
+Task and Project OS locks prevent duplicate run ownership and concurrent shared-checkout mutation across processes. Tasks execute serially in the selected repository. Creating or changing another Task's checkout can invalidate a frozen ready/paused baseline; no automatic reset, per-Task worktree or parallel worker orchestration is introduced.
+
+### 0.11 Controller persistence, recovery and acceptance
+
+Persist spec/initial/fix worker intents, reviewer/Owner/evidence sends and local evidence execution in the controller tables; the Phase 6 publisher retains its own push/PR journals in the same database. Use planned, in-flight, confirmed, completed, ambiguous or failed effect states. Counter and in-flight intent commit together before dispatch. Counters measure conservative attempts, including an unknown outcome after a crash; they do not estimate token/quota usage.
+
+Recovery can reconcile an exact spec commit, inspect a confirmed saved worker turn through Phase 4 without issuing another turn, query an already-published candidate/PR read-only, and reuse durable raw responses/decisions or completed evidence summaries. Unknown dispatched worker or send ownership pauses explicitly; it cannot create another thread, fix turn, notification or evidence continuation. Unknown local evidence execution also pauses instead of rerunning potentially effectful configured tests. Candidate/cycle mutation invalidates the pending review persistently; restoring an old SHA does not permit applying that decision. Cleanup failures are recorded without granting effects or hiding the condition.
+
+`tests/test_controller.py` uses real temporary Git repositories, bare remotes and StateStore with fake worker/reviewer/PR services. Acceptance covers direct PASS, evidence→PASS, fix→PASS, evidence→fix→PASS, explicit Owner input, branch and PR mode, thread/branch continuity, zero ordinary attachments, configured local evidence, limits, unsafe/incomplete/oversized evidence, failures, stale/local/remote mutation, permanent invalidation, cross-process locks, migration retention/rollback and spec/worker/push/send/raw/parse/evidence/fix crash boundaries. Real offscreen Qt tests in `tests/test_task_ui.py` cover intentional spec creation, ready gating, background responsiveness, duplicate controls, Owner decisions, Stop and reopening. All Phase 1–6 tests remain required.
+
+Live acceptance requires an explicitly Owner-authorized harmless disposable PUBLIC Project, working publication, reviewer repository access, authenticated dedicated profile and usable Codex runtime. Missing prerequisites mean `LIVE_AUTONOMOUS_SMOKE=NOT_RUN`; offline fakes never substitute for live proof. This host has no authorized remote and no `gh`; no live model probe, GitHub write or real/private project substitution is performed. No Phase 7 narrative implementation/audit report is required. See `.reviewrelay/tasks/REVIEWRELAY_V1_PHASE7_AUTONOMOUS_CONTROLLER.md` for the approved development contract. Phase 8 remains gated by a separate Owner task.
 
 ---
 
@@ -184,7 +222,7 @@ Repeat until PASS or escalation
 Owner
 ```
 
-Autonomous routing in this target loop remains deferred. The core quota model is:
+Phase 7 implements this routing with the boundaries in sections 0.10–0.11. The core quota model is:
 
 ```text
 Codex implementation     → Codex quota
@@ -281,7 +319,7 @@ ReviewRelay:
 - retains independent patch/evidence generation as legacy/local diagnostic capability;
 - parses reviewer control output;
 - fulfills safe evidence requests locally;
-- exposes the same worker-session instruction boundary for explicit caller use; autonomous routing is deferred;
+- routes validated fixes through the same Task-owned worker thread and collects validated evidence locally;
 - protects against stale reviews and uncontrolled loops;
 - cleans disposable artifacts automatically.
 
@@ -314,7 +352,7 @@ Worker reports are useful for context but must not replace repository-derived ev
 ┌─────────────────────────────────────────────────────┐
 │                  ReviewRelay Core                   │
 │                                                     │
-│  Explicit caller (autonomous controller deferred)    │
+│  Persisted TaskController (Phase 7)                  │
 │       │                                             │
 │       ├── Git / Candidate Verifier                  │
 │       ├── Evidence Collector                        │
@@ -765,7 +803,7 @@ The reviewer reads source directly from GitHub and may request genuinely local/r
 
 ReviewRelay should fulfill the request locally whenever possible.
 
-Target future routing (not automated by Phase 6):
+Phase 7 controller routing:
 
 ```text
 ChatGPT
@@ -776,7 +814,7 @@ ReviewRelay validates request
    ↓
 Local evidence collection
    ↓
-Upload additional evidence
+Send bounded textual evidence continuation
    ↓
 ChatGPT continues same review
 ```
@@ -1077,13 +1115,13 @@ When complete, return RELAY_WORKER_DONE and the exact local candidate SHA.
 Do not publish, manage PRs or create required implementation/audit reports.
 ```
 
-The future caller/controller independently verifies the next candidate and review cycle. The Phase 6 publisher updates the same task branch/PR when explicitly invoked; it does not automatically dispatch this worker flow.
+The Phase 7 controller independently verifies the next candidate/cycle and uses the Phase 6 publisher to update the same task branch/PR before sending the next compact notification.
 
 ---
 
 ## 28. Same Worker Session Requirement
 
-V1 should reuse the same Codex session for all fix cycles of one task when technically possible.
+Phase 7 requires the exact same Codex thread for every fix of one Task. A missing, mismatched or unresolved thread pauses; no replacement thread is silently created.
 
 Reason:
 
@@ -1287,38 +1325,38 @@ The reviewer protocol has no command capable of invoking these operations.
 
 ## 36. State Machine
 
+Phase 7 persists the following controller states separately while keeping the legacy TaskState enum and mapping compatible:
+
 ```text
-IDLE
+DRAFT
  ↓
-PRECHECK
+READY
  ↓
 WORKER_RUNNING
  ↓
-VERIFY_CANDIDATE
+VERIFYING_CANDIDATE
  ↓
-BUILD_REVIEW_PACK
+PUBLISHING
  ↓
-SEND_REVIEW
+WAITING_REVIEW
  ↓
-WAIT_REVIEW
- ↓
-PARSE_REVIEW
+PROCESSING_REVIEW
  ├── PASS ─────────────────────→ COMPLETE
  │
  ├── FIX_REQUIRED ─────────────→ WORKER_RUNNING
  │
- ├── NEED_EVIDENCE ────────────→ COLLECT_EVIDENCE
+ ├── NEED_EVIDENCE ────────────→ COLLECTING_EVIDENCE
  │                                  ↓
- │                              SEND_EVIDENCE
+ │                              SENDING_EVIDENCE
  │                                  ↓
- │                              WAIT_REVIEW
+ │                              WAITING_REVIEW
  │
  ├── OWNER_DECISION_REQUIRED ──→ PAUSED_OWNER
  │
  └── REVIEW_ERROR ─────────────→ PAUSED_ERROR
 ```
 
-Additional blocking states:
+User controls also persist PAUSED_USER/STOPPED. Additional blocking error codes include:
 
 ```text
 BLOCKED_DIRTY_BASELINE
@@ -1357,13 +1395,13 @@ ReviewRelay must resume from persistent state after restart.
 
 Example:
 
-If the app crashes after review upload but before response parsing:
+If the app crashes after reviewer dispatch but before response parsing:
 
 ```text
-state = WAIT_REVIEW
+state = WAITING_REVIEW
 ```
 
-On restart it must resume waiting/reading the existing review, not blindly upload a duplicate.
+Reuse durable captured raw/validated decisions if present. Without owned raw response, pause an already-dispatched send explicitly; never reconstruct transport ownership or post a duplicate. Evidence and worker recovery follow the same intent-before-effect rule in section 0.11.
 
 ---
 
@@ -1372,10 +1410,10 @@ On restart it must resume waiting/reading the existing review, not blindly uploa
 Every review send operation should have a deterministic identity:
 
 ```text
-PROJECT_ID + TASK_ID + CANDIDATE_SHA + CYCLE
+PROJECT_ID + TASK_ID + MESSAGE_KIND + MESSAGE_NUMBER
 ```
 
-Before sending, ReviewRelay checks whether that exact review request was already sent.
+Persist candidate/cycle, conversation identity and request hash with this controller identity. Before sending, check whether the exact message was dispatched. A distinct evidence or Owner continuation can share the same candidate/cycle without colliding with its source-review request.
 
 Goal:
 
@@ -1490,7 +1528,7 @@ storage:
 
 V1 UI must remain lightweight.
 
-Phase 6 implements the minimal Project Hub/setup described in section 0.9. The task controls and activity view below remain a future product target.
+Phase 6 implements the minimal Project Hub/setup described in section 0.9. Phase 7 implements New Task/Start/Pause/Resume/Stop/Owner Decision and the status/counter/timeline view in section 0.10. The sketch below remains illustrative; browser docking and advanced panels are deferred.
 
 Recommended:
 
@@ -1811,11 +1849,11 @@ Acceptance:
 - optional live gates use an authorized remote or remain NOT_RUN;
 - autonomous worker/fix/evidence routing is not implemented.
 
-### Phase 7 — Autonomous Task Loop (Owner gate)
+### Phase 7 — Autonomous Task Controller
 
-Future roadmap only. Do not start without a separate Owner-approved task. Phase 6 has implemented Project setup and publishing primitives; autonomous task routing, comprehensive secret scanning, full task UI and packaging remain deferred to explicit Owner decisions.
+Implemented under the approved Phase 7 contract. Comprehensive secret scanning, UI polish, browser docking and packaging remain deferred. Do not start Phase 8 without a separate Owner task.
 
-Potential work:
+Implemented scope:
 
 - Task creation/start from a ready Project and committed canonical spec;
 - explicit controller wiring of worker, exact publisher, reviewer and local verification;
@@ -1824,13 +1862,16 @@ Potential work:
 
 Acceptance:
 
-- acceptance criteria must be supplied in the separate Phase 7 Owner task; none of this future routing is implemented by Phase 6.
+- all offline controller/UI/migration and Phase 1–6 regression gates in section 0.11 pass;
+- restart does not duplicate uncertain pushes, PRs, source/evidence messages or fixes;
+- live smoke uses all authorized disposable-public-project prerequisites or remains NOT_RUN;
+- PASS means READY_FOR_OWNER_REVIEW, with no autonomous merge/main push/tag/deploy/release.
 
 ---
 
 ## 52. V1 Acceptance Matrix
 
-This is a product target matrix, not a claim that every future capability is implemented. Phase 6 acceptance is defined in sections 0.6–0.9 and the canonical task spec; autonomous controller, comprehensive scanner and full task UI remain deferred. Minimal Project Hub/setup is implemented.
+This is a product target matrix, not a claim that every future capability is implemented. Phase 6 acceptance is defined in sections 0.6–0.9; Phase 7 controller/minimal Task UI acceptance is defined in sections 0.10–0.11 and its canonical task spec. Comprehensive scanning, automatic archive orchestration, visual polish, docking and packaging remain deferred. No Phase 8 work is authorized.
 
 | Requirement | V1 Acceptance |
 |---|---|
@@ -1879,9 +1920,9 @@ The following are hard requirements and must not drift during implementation:
 9. **Dirty or mutable candidate states fail closed.**
 10. **NEED_EVIDENCE supplies local/runtime verification; GitHub supplies normal source review. DSL compatibility remains.**
 11. **Reviewer cannot execute arbitrary shell commands.**
-12. **Same Codex worker session is reused when possible.**
+12. **One Task owns one Codex thread; all fixes reuse that exact thread.**
 13. **Automatic loops are bounded.**
-14. **Secrets must be scanned before artifact upload. The broader scanner remains a deferred product requirement, not a Phase 6 implementation claim; credential transfer into configuration/ChatGPT is prohibited.**
+14. **Secrets must be scanned before artifact upload. The broader scanner remains a deferred product requirement, not a Phase 7 implementation claim; credential transfer into configuration/ChatGPT is prohibited. Live autonomous acceptance uses only an explicitly authorized harmless disposable public repository.**
 15. **Primary data lives in a portable user-selected data root.**
 16. **Disposable evidence is automatically garbage-collected.**
 17. **ReviewRelay never performs production deployment/release authority actions.**

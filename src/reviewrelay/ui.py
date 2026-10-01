@@ -1,4 +1,4 @@
-"""Minimal Project Hub and setup UI; no task execution or embedded browser."""
+"""Minimal Project Hub and setup UI with a separate Task control window."""
 from __future__ import annotations
 
 import argparse
@@ -227,6 +227,7 @@ class ProjectHub(QMainWindow):
         self.pool = QThreadPool(self)
         self.pool.setMaxThreadCount(1)
         self.busy = False
+        self.task_windows = []
         self._job = None
         self._callback = None
         widget = QWidget()
@@ -267,9 +268,10 @@ class ProjectHub(QMainWindow):
         self.codex_button = QPushButton("Connect Codex Worker Runtime")
         self.refresh_button = QPushButton("Inspect Local Repository")
         self.unregister_button = QPushButton("Unregister Project")
+        self.tasks_button = QPushButton("Tasks / + New Task")
         for button, callback in ((self.initialize_button, self.initialize_git), (self.snapshot_button, self.preview_snapshot),
             (self.github_button, self.configure_github), (self.reviewer_button, self.configure_reviewer),
-            (self.codex_button, self.configure_codex), (self.refresh_button, self.inspect_project), (self.unregister_button, self.unregister_project)):
+            (self.codex_button, self.configure_codex), (self.refresh_button, self.inspect_project), (self.unregister_button, self.unregister_project), (self.tasks_button, self.open_tasks)):
             button.clicked.connect(callback)
             details.addWidget(button)
         details.addStretch()
@@ -281,7 +283,7 @@ class ProjectHub(QMainWindow):
         outer.addWidget(self.message)
         self.setCentralWidget(widget)
         self.controls = [self.create_button, self.rename_button, self.initialize_button, self.snapshot_button,
-            self.github_button, self.reviewer_button, self.codex_button, self.refresh_button, self.unregister_button]
+            self.github_button, self.reviewer_button, self.codex_button, self.refresh_button, self.unregister_button, self.tasks_button]
         self.refresh_projects()
 
     @property
@@ -333,6 +335,7 @@ class ProjectHub(QMainWindow):
         self.codex_label.setText(f"Codex Worker: {project.codex_status.value}\n{project.worker_settings.get('executable') or 'Not configured'}")
         self.reviewer_button.setEnabled(not self.busy and project.repository_ready)
         self.codex_button.setEnabled(not self.busy and project.repository_ready)
+        self.tasks_button.setEnabled(not self.busy and project.ready)
         self.github_button.setEnabled(not self.busy and project.local_status is ConnectionStatus.READY)
         self.github_button.setText("Verify GitHub Binding" if project.github_last_verified_at else "Detect / Create / Link GitHub")
         self.initialize_button.setEnabled(not self.busy and project.local_status is not ConnectionStatus.READY)
@@ -482,8 +485,23 @@ class ProjectHub(QMainWindow):
                 return registry.unregister(project_id, confirmed=True)
         self.start_job("Unregistering Project", work)
 
+    def open_tasks(self):
+        from .task_ui import TaskWindow
+        project = self.selected()
+        if project is None or not project.ready:
+            return
+        for window in self.task_windows:
+            if window.project_id == project.project_id:
+                window.show()
+                window.raise_()
+                window.activateWindow()
+                return
+        window = TaskWindow(self.root, project.project_id, self)
+        self.task_windows.append(window)
+        window.show()
+
     def closeEvent(self, event):
-        if self.busy:
+        if self.busy or any(window.busy for window in self.task_windows):
             self.message.setText("Wait for the current setup operation to finish before closing.")
             event.ignore()
         else:

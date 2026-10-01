@@ -4,7 +4,7 @@ ReviewRelay is a small standalone foundation for relaying implementation work to
 
 ## Status
 
-Phases 1–6 are implemented as explicit components. Phase 3 provides the ChatGPT web transport; Phase 4 provides a separately invoked Codex app-server worker adapter; Phase 5 is the Local Verification Executor; Phase 6 provides the persistent Project registry, repository setup, minimal PySide6 Project Hub and the GitHub candidate/review bridge. No autonomous controller or Phase 7 is implemented. Live smoke procedures are explicit development tools and are not part of automated tests.
+Phases 1–7 are implemented. Phase 3 provides the ChatGPT web transport; Phase 4 provides the Codex app-server worker adapter; Phase 5 is the Local Verification Executor; Phase 6 provides Project setup and the GitHub candidate/review bridge. Phase 7 adds the persisted autonomous Task controller and minimal Task UI. Live smoke procedures remain explicit Owner-authorized development actions outside automated tests. Phase 8 has not started.
 
 Normal source review uploads no patch, worker report, implementation report, audit report or source snapshots. Historical reports and attachment/evidence APIs remain available for compatibility and explicit local diagnostics; they are not prerequisites or automatic fallbacks for GitHub review. New tasks share one committed `.reviewrelay/tasks/<TASK_ID>.md`, not generated narrative reports.
 
@@ -52,11 +52,45 @@ After GitHub verification, bind one existing ChatGPT conversation to the Project
 
 Select a Codex executable explicitly and optionally set model/reasoning defaults. Local version, app-server/stdio capability and supported login-status checks validate the runtime without inference or thread creation. This does not prove live access to a selected model. Each unrelated Task owns its own Codex thread; FIX_REQUIRED resumes that Task's thread. Project records contain no permanent thread ID, candidate SHA or review cycle.
 
-`ProjectRegistry` stores stable IDs and component configuration in the existing `db/relay.db`. Schema 5 adds Projects/events and migrates Phase 5 schema 3 and bridge schema 4 without losing prior task/worker/publication/review records. Historical configurations are preserved; they are not silently converted into ready Project registrations. Resolved local paths and canonical GitHub owner/repo identities are unique. Rename preserves identity and Task bindings. **Unregister** requires confirmation and removes only registration; local source, `.git`, GitHub and task history remain.
+`ProjectRegistry` stores stable IDs and component configuration in the existing `db/relay.db`. Current schema 6 retains Phase 5 worker state, bridge schema 4 and Phase 6 Project/schema 5 data, and adds controller lifecycle, effects, review history and events. Historical configurations are preserved; they are not silently converted into ready Project registrations. Resolved local paths and canonical GitHub owner/repo identities are unique. Rename preserves identity and Task bindings. **Unregister** requires confirmation and removes only registration; local source, `.git`, GitHub and task history remain.
 
 `ProjectSetupService` journals intended repository creation, remote addition and initial push under an OS Project lock. Restart uses exact-identity discovery and read-only reconciliation; ambiguous effects require Owner intervention rather than duplicate creation or blind retry. Registered Tasks must use their ready Project configuration. The existing publisher verifies Task candidates and uses the Project's GitHub binding; compact notifications include Project ID/name and canonical repository/PR URLs, with no source/report/patch attachments.
 
-Run the foundation tests with `python -m pytest -q tests/test_projects.py tests/test_project_ui.py`. The required local end-to-end smoke creates an empty Project, initializes Git, binds a fake GitHub service backed by a real bare remote, verifies initial SHA, connects fake reviewer/runtime services, publishes a Task candidate and verifies its exact remote SHA and zero-attachment notification. Qt tests check choices, readiness, typed errors, busy guards and responsiveness. These offline results do not establish live GitHub/ChatGPT access. `LIVE_GITHUB_PROJECT_CREATE=NOT_RUN`: this host has no authorized destination and no installed `gh`. This phase implements setup only; there is no New Task orchestration UI or autonomous loop.
+Run the foundation tests with `python -m pytest -q tests/test_projects.py tests/test_project_ui.py`. The required local end-to-end smoke creates an empty Project, initializes Git, binds a fake GitHub service backed by a real bare remote, verifies initial SHA, connects fake reviewer/runtime services, publishes a Task candidate and verifies its exact remote SHA and zero-attachment notification. Qt tests check choices, readiness, typed errors, busy guards and responsiveness. These offline results do not establish live GitHub/ChatGPT access. `LIVE_GITHUB_PROJECT_CREATE=NOT_RUN`: this host has no authorized destination and no installed `gh`. Phase 7 composes these accepted foundations below.
+
+## Phase 7 autonomous Tasks
+
+Select a ready Project, open **Tasks / + New Task**, then **+ New Task**. Enter the Task ID, title and requirement. **Create and Commit Task Specification** intentionally writes only `.reviewrelay/tasks/<TASK_ID>.md`, commits it and records the actual clean Git HEAD as `BASE_SHA`. Unrelated local changes block creation. No worker runs until **Start**.
+
+The canonical spec is immutable by default. Spec changes require the explicit creation-time checkbox; they cannot be authorized retroactively by a reviewer or restart. A new implementation commit is required by default. Task creation also captures fix/evidence limits (defaults 3/5) and an optional Owner-configured test registry of fixed argv commands. A reviewer selects only validated Phase 2 test IDs.
+
+```text
+READY → WORKER_RUNNING → VERIFYING_CANDIDATE → PUBLISHING
+→ WAITING_REVIEW → PROCESSING_REVIEW
+    PASS                    → COMPLETE / READY_FOR_OWNER_REVIEW=YES
+    FIX_REQUIRED            → same-thread worker → new candidate → same branch/PR
+    NEED_EVIDENCE           → local verification → bounded text → same review
+    OWNER_DECISION_REQUIRED → PAUSED_OWNER → explicit Owner input to reviewer
+    REVIEW_ERROR            → PAUSED_ERROR
+```
+
+One unrelated Task gets one Codex thread; all its fixes reuse that exact thread. App-server completion proves transport completion. Relay independently checks the actual committed clean local candidate, ancestor relationship and spec, publishes its immutable SHA through the Phase 6 publisher, and verifies remote/optional PR equality before notifying ChatGPT. Worker narrative and typed SHAs do not establish Git truth. Normal review notifications attach **zero files** and use the existing Phase 3 single-send, response ownership, completion and raw extraction behavior. Raw responses and validated Phase 2 decisions are durable before routing.
+
+`NEED_EVIDENCE` invokes only Phase 5 `LocalEvidenceExecutor`; it adds no Codex turn. Complete candidate-bound evidence and verified manifest hashes produce a deterministic JSON-quoted continuation, limited to 16 KiB per artifact and 48 KiB combined. A failed configured test is valid evidence. Incomplete, unsafe, binary or oversized evidence pauses; Phase 7 does not automatically attach artifacts or fall back to source uploads. Durable text summaries avoid rerunning a completed evidence batch after restart.
+
+The Task window shows spec, branch, base/candidate/remote SHAs, component states, thread, cycles, counters, PR and a persisted operational timeline. Git/browser/worker jobs run outside the UI thread. **Pause** takes effect at a safe checkpoint after an ongoing effect; **Stop** requests interruption of active waits and prohibits further effects. **Resume** uses persisted state without blind replay. **Owner Decision** sends explicit Owner input to the reviewer for the same candidate, never directly to Codex. Cycle-limit escalation requires Owner resolution and cannot be overridden by that button. PASS marks review completion only: no merge, main push, tag, deployment or release.
+
+Backend entry points are `TaskController.create_task`, `run(task_id, resume=False)`, `request_pause`, `request_stop` and `resume_with_owner_decision`. Create a controller in the background job's thread and close its store after the awaited operation. Worker, reviewer, publisher, Git and evidence factories provide deterministic test seams; production defaults use the existing adapters.
+
+Task and Project OS locks exclude concurrent controllers and shared-checkout mutation, including setup/rename/unregister. Tasks share the configured checkout and execute serially; changing it while another Task is paused or ready can invalidate that Task's frozen baseline/candidate. No automatic reset or per-Task worktree is introduced.
+
+The existing database journals spec commit, initial/fix worker dispatch, push/PR effects, review/Owner/evidence sends and local evidence execution before effects. Restart can adopt a proven spec commit, query an exact saved worker turn without starting another turn, reconcile an already-published SHA/PR read-only, and reuse captured raw responses or completed evidence. Unresolved dispatched sends/turns/evidence pause explicitly; no automatic resend or replacement thread. Candidate/cycle mutation permanently invalidates the pending review, even if the old SHA is restored. Cleanup failures are durable operational events and cannot authorize another effect.
+
+Counters (`worker_initial_turns`, `worker_fix_turns`, `review_messages`, `evidence_messages`, `local_evidence_batches`) commit with in-flight intents. They count conservative dispatch attempts; a crash between intent and dispatch can leave an attempt with an unknown outcome. They are not token or quota estimates. Successful offline routes assert actual fake-call counts as well as these persisted counters.
+
+Run `python -m pytest -q tests/test_controller.py tests/test_task_ui.py`, then full regression and compilation. Tests use actual temporary Git/bare repositories and SQLite, fake worker/reviewer/PR services and real offscreen Qt. They cover direct PASS, evidence→PASS, FIX→PASS, evidence→FIX→PASS, Owner pause/resume, branch and PR mode, distinct unrelated threads, same-thread fixes, failures, limits, mutation/invalidation, ownership and crash/restart boundaries without model quota or real GitHub writes.
+
+`LIVE_AUTONOMOUS_SMOKE=NOT_RUN` on this host. It requires an explicitly Owner-authorized disposable harmless PUBLIC Project, working GitHub publication, reviewer repository access, the authenticated dedicated reviewer profile and a proven usable Codex runtime. No real/private development project or guessed GitHub destination substitutes for missing prerequisites. A model catalog or Project readiness alone does not prove live model entitlement. No Phase 7 narrative implementation/audit report is generated; source, tests, canonical docs, Git and durable Relay state provide the evidence.
 
 ## Phase 1 scope
 
@@ -112,13 +146,13 @@ The smoke prints the raw response and requires the new owned response to contain
 
 ## Deferred scope
 
-Autonomous review loop, comprehensive secret scanner, task execution/timeline UI, browser dock, packaging, cloud service, arbitrary reviewer-driven shell execution, and production/release logic remain deferred. The minimal Project Hub/setup UI is implemented. Configured test commands are executed only when a validated Phase 2 `test_id` selects them during local evidence collection.
+Comprehensive secret scanning, visual polish, browser docking, advanced worker panels, packaging and cloud service remain deferred. The minimal Project/Task UI and autonomous review loop are implemented through Phase 7. Arbitrary reviewer-driven shell execution and autonomous production/release authority remain prohibited. Configured evidence tests execute only when a validated Phase 2 `test_id` selects them. Phase 8 requires a separate Owner task.
 
 ## Phase 4 worker adapter
 
 `WorkerAdapter` is an async boundary. `CodexAppServerAdapter` launches `codex app-server --listen stdio://` directly with separate pipes, performs `initialize` / `initialized`, and creates or resumes a persistent Codex thread. Call Phase 1 `begin_task` before `start_task`. Supply exactly one prompt text or prompt file; call `wait_until_done` and `get_final_response` to capture the completed response. `send_instruction` continues the saved thread, and a new adapter uses `resume_task` after restart. Always await `close` in a `finally` block.
 
-SQLite schema 5 preserves the Phase 4 task/repository/Codex-thread bindings, bridge publication/review tables and adds Project registration/setup events. A task lock prevents concurrent worker adapters. Only `turn/completed` with `completed` status is transport success. Failed, interrupted, timeout, dead-process, and malformed-protocol outcomes have typed errors; no replacement thread or exec fallback is created automatically. Final responses remain untrusted narrative; `TaskStorage.persist_worker_report` is retained for compatibility, with no required per-task implementation/audit report in the normal GitHub flow.
+SQLite schema 6 preserves the Phase 4 task/repository/Codex-thread bindings and all later Project/publication/review state. A task lock prevents concurrent worker adapters. Only `turn/completed` with `completed` status is transport success. Failed, interrupted, timeout, dead-process, and malformed-protocol outcomes have typed errors; no replacement thread or exec fallback is created automatically. Final responses remain untrusted narrative; `TaskStorage.persist_worker_report` is retained for compatibility, with no required per-task implementation/audit report in the normal GitHub flow.
 
 Optional `worker` configuration supports `executable`, `model`, `reasoning_effort`, `sandbox` (`workspace-write` or `read-only`), and `timeouts` (`startup_seconds`, `initialize_seconds`, `request_seconds`, `idle_seconds`, `overall_seconds`, `shutdown_seconds`). Omitted model/effort use Codex configuration. Existing local Codex login is reused through Codex itself; ReviewRelay does not read credential files. Interactive server requests stop with a typed error for caller handling.
 

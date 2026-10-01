@@ -325,7 +325,7 @@ def test_v2_migration_preserves_existing_state_and_worker_fields_reload(tmp_path
         state.save(old)
     connection = sqlite3.connect(root.safe_path("db/relay.db"))
     connection.execute("DROP INDEX worker_thread_identity")
-    for table in ("github_publications", "github_events", "github_reviews", "projects", "project_events"):
+    for table in ("github_publications", "github_events", "github_reviews", "projects", "project_events", "controller_tasks", "controller_effects", "controller_reviews", "controller_events"):
         connection.execute(f"DROP TABLE {table}")
     for column in ("worker_thread_id", "worker_repo_path", "worker_last_turn_id", "worker_last_turn_status", "worker_last_event_at"):
         connection.execute(f"ALTER TABLE tasks DROP COLUMN {column}")
@@ -334,7 +334,7 @@ def test_v2_migration_preserves_existing_state_and_worker_fields_reload(tmp_path
     connection.close()
     with StateStore(root) as state:
         assert state.get("project", "old-task") == old
-        assert state._connection.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION == 5
+        assert state._connection.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION == 6
         worker = replace(old, worker_thread_id="thread", worker_repo_path="repo", worker_last_turn_id="turn",
                          worker_last_turn_status="COMPLETED", worker_last_event_at="timestamp")
         state.save(worker)

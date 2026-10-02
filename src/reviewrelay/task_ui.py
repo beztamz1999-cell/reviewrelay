@@ -13,15 +13,16 @@ from .controller import TaskController
 from .approval_ui import CommandApprovalBridge
 from .controller_store import ControllerState as S, ControllerStore
 from .github_publish import task_branch_name, task_spec_path
-from .ui import Job, dialog_buttons
+from .ui import Job, dialog_buttons, owner_input, explanation
 from .worker_management import worker_view, same_path
 from .owner_recovery import RecoveryAction, recovery_action
+from .ui_text import recovery_text, state_text, detail_text
 
 
 class NewTaskDialog(QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("New Task — commit the canonical Owner specification")
+        self.setWindowTitle("Tạo công việc mới")
         self.resize(720, 680)
         layout = QVBoxLayout(self)
         form = QFormLayout()
@@ -30,25 +31,25 @@ class NewTaskDialog(QDialog):
         for widget, value in ((self.fix_limit, 3), (self.evidence_limit, 5)):
             widget.setRange(0, 100)
             widget.setValue(value)
-        form.addRow("Task ID", self.task_id)
-        form.addRow("Title", self.title)
-        form.addRow("Max fix cycles", self.fix_limit)
-        form.addRow("Max evidence cycles", self.evidence_limit)
+        form.addRow("Mã công việc", self.task_id)
+        form.addRow("Tiêu đề", self.title)
+        form.addRow("Số vòng sửa tối đa", self.fix_limit)
+        form.addRow("Số vòng kiểm chứng tối đa", self.evidence_limit)
         layout.addLayout(form)
         self.spec = QTextEdit()
-        self.spec.setPlaceholderText("Paste the Owner requirement. ReviewRelay will commit only .reviewrelay/tasks/<TASK_ID>.md before the worker starts.")
+        self.spec.setPlaceholderText("Nhập yêu cầu của Owner. ReviewRelay sẽ lưu .reviewrelay/tasks/<TASK_ID>.md thành commit riêng trước khi Codex bắt đầu.")
         layout.addWidget(self.spec)
-        self.require_changes = QCheckBox("Require a new implementation commit")
+        self.require_changes = QCheckBox("Yêu cầu commit code mới")
         self.require_changes.setChecked(True)
-        self.allow_spec_change = QCheckBox("Explicitly authorize this Task to change its canonical specification")
+        self.allow_spec_change = QCheckBox("Cho phép công việc này thay đổi đặc tả gốc")
         layout.addWidget(self.require_changes)
         layout.addWidget(self.allow_spec_change)
         self.tests = QTextEdit()
         self.tests.setMaximumHeight(80)
-        self.tests.setPlaceholderText('Optional Owner test registry JSON, e.g. {"unit": ["python", "-m", "pytest", "-q"]}')
+        self.tests.setPlaceholderText('Cấu hình test bổ sung của Owner (JSON), ví dụ {"unit": ["python", "-m", "pytest", "-q"]}')
         layout.addWidget(self.tests)
-        layout.addWidget(QLabel("Create intentionally writes and commits the Task specification. Other local changes block creation. Start performs the automated loop."))
-        self.buttons = dialog_buttons(self, "Create and Commit Task Specification")
+        layout.addWidget(explanation("ReviewRelay sẽ lưu yêu cầu công việc thành một commit riêng trước khi Codex bắt đầu. Cần xử lý các thay đổi local khác trước khi tạo. Chọn Bắt đầu để chạy tự động."))
+        self.buttons = dialog_buttons(self, "Tạo công việc")
         layout.addWidget(self.buttons)
         for edit in (self.task_id, self.title):
             edit.textChanged.connect(self.validate)
@@ -62,7 +63,7 @@ class NewTaskDialog(QDialog):
     def values(self):
         tests = json.loads(self.tests.toPlainText()) if self.tests.toPlainText().strip() else {}
         if not isinstance(tests, dict):
-            raise ValueError("Owner test registry must be a JSON object")
+            raise ValueError("Cấu hình test của Owner phải là một đối tượng JSON")
         tests = {key: tuple(value) if isinstance(value, list) else value for key, value in tests.items()}
         return dict(task_id=self.task_id.text().strip(), title=self.title.text().strip(), spec=self.spec.toPlainText(),
             require_changes=self.require_changes.isChecked(), allow_spec_change=self.allow_spec_change.isChecked(),
@@ -76,14 +77,14 @@ class TaskWindow(QMainWindow):
         self.approvals = CommandApprovalBridge(self, self.valid_approval)
         self.factory = controller_factory or (lambda: TaskController(root, project_id,
             command_approval=self.approvals.approve))
-        self.setWindowTitle("ReviewRelay — Tasks")
+        self.setWindowTitle("ReviewRelay — Công việc")
         self.resize(1100, 780)
         self.pool = QThreadPool(self)
         self.pool.setMaxThreadCount(1)
         self.busy, self._job, self.running_task_id = False, None, None
         content = QWidget()
         layout = QVBoxLayout(content)
-        self.new_button = QPushButton("+ New Task")
+        self.new_button = QPushButton("+ Tạo công việc")
         self.new_button.clicked.connect(self.new_task)
         layout.addWidget(self.new_button)
         body = QHBoxLayout()
@@ -91,11 +92,11 @@ class TaskWindow(QMainWindow):
         self.tasks.setMaximumWidth(260)
         self.tasks.currentItemChanged.connect(self.show_task)
         workers = QVBoxLayout()
-        workers.addWidget(QLabel("Codex Workers — selected Project"))
+        workers.addWidget(QLabel("Codex Worker — dự án hiện tại"))
         workers.addWidget(self.tasks)
         body.addLayout(workers)
         detail = QVBoxLayout()
-        self.summary = QLabel("Select a Task")
+        self.summary = QLabel("Chọn một công việc")
         self.summary.setTextFormat(Qt.TextFormat.PlainText)
         self.summary.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         self.summary.setWordWrap(True)
@@ -106,7 +107,7 @@ class TaskWindow(QMainWindow):
         detail.addWidget(self.spec)
         controls = QHBoxLayout()
         self.start_button, self.pause_button, self.resume_button, self.stop_button, self.owner_button = (
-            QPushButton(label) for label in ("Start", "Pause", "Resume", "Stop", "Owner Decision"))
+            QPushButton(label) for label in ("Bắt đầu", "Tạm dừng", "Tiếp tục", "Dừng", "Quyết định của Owner"))
         for button, callback in ((self.start_button, lambda: self.start(False)), (self.pause_button, self.pause),
             (self.resume_button, lambda: self.start(True)), (self.stop_button, self.stop), (self.owner_button, self.owner_decision)):
             button.clicked.connect(callback)
@@ -114,7 +115,7 @@ class TaskWindow(QMainWindow):
         detail.addLayout(controls)
         worker_controls = QHBoxLayout()
         self.open_worker_button, self.pause_auto_button, self.manual_button, self.resume_auto_button = (
-            QPushButton(label) for label in ("Open Worker", "Pause Auto Relay", "Send Manual Instruction", "Resume Auto Relay"))
+            QPushButton(label) for label in ("Xem Worker", "Tạm dừng tự động", "Gửi chỉ dẫn thủ công", "Tiếp tục tự động"))
         for button, callback in ((self.open_worker_button, self.open_worker), (self.pause_auto_button, self.pause_auto),
                 (self.manual_button, self.manual_instruction), (self.resume_auto_button, self.resume_auto)):
             button.clicked.connect(callback)
@@ -132,10 +133,11 @@ class TaskWindow(QMainWindow):
         detail.addWidget(self.worker_identity)
         self.timeline = QTextEdit()
         self.timeline.setReadOnly(True)
+        detail.addWidget(QLabel("Nhật ký hoạt động"))
         detail.addWidget(self.timeline)
         body.addLayout(detail, 1)
         layout.addLayout(body)
-        self.message = QLabel("Start runs the Task loop. Pause waits for a safe checkpoint; Stop requests interruption. PASS is ready for Owner review.")
+        self.message = QLabel("Bắt đầu chạy công việc tự động. Tạm dừng chờ điểm dừng an toàn; Dừng yêu cầu ngắt công việc. PASS nghĩa là sẵn sàng để Owner duyệt.")
         self.message.setTextFormat(Qt.TextFormat.PlainText)
         self.message.setWordWrap(True)
         layout.addWidget(self.message)
@@ -164,7 +166,7 @@ class TaskWindow(QMainWindow):
         self.tasks.blockSignals(True)
         self.tasks.clear()
         for task in tasks:
-            item = QListWidgetItem(f"{task.task_id} — {views[task.task_id].status.value}")
+            item = QListWidgetItem(f"{task.task_id} — {state_text(views[task.task_id].status)}")
             item.setData(Qt.ItemDataRole.UserRole, task.task_id)
             self.tasks.addItem(item)
             if task.task_id == selected:
@@ -186,22 +188,22 @@ class TaskWindow(QMainWindow):
                 view = worker_view(store, self.project_id, self.task_id)
             identity = view.identity
             self.worker_identity.setText(f"PROJECT_ID={identity.project_id}\nTASK_ID={identity.task_id}\n"
-                f"WORKER_THREAD_ID={identity.worker_thread_id or 'Not started'}\nREPOSITORY={identity.repository}\n"
-                f"TASK_BRANCH={identity.task_branch}\nWORKER_STATUS={view.status.value}")
+                f"WORKER_THREAD_ID={identity.worker_thread_id or 'Chưa bắt đầu'}\nREPOSITORY={identity.repository}\n"
+                f"TASK_BRANCH={identity.task_branch}\nTrạng thái Worker: {state_text(view.status)}")
             counters = task.counters
-            self.summary.setText(f"Task: {task.task_id} — {task.title}\nState: {task.state.value}\nSpec: {task_spec_path(task.task_id)}\n"
-                f"Branch: {task_branch_name(task.task_id)}\nBase SHA: {task.base_sha or 'Not committed'}\nCandidate SHA: {task.candidate_sha or 'None'}\n"
-                f"Remote SHA: {publication['github_last_remote_sha'] if publication else 'None'}\n"
-                f"Codex: {record.worker_last_turn_status or 'Not started'} | thread: {record.worker_thread_id or 'None'} | turns: {counters['worker_initial_turns'] + counters['worker_fix_turns'] + counters.get('worker_continuation_turns', 0) + counters.get('worker_manual_turns', 0)}\n"
-                f"GitHub: {publication['github_publish_status'] if publication else 'Not published'} | PR: {publication['github_pr_url'] if publication else 'None'}\n"
-                f"ChatGPT: {task.state.value} | review messages: {counters['review_messages']} | evidence messages: {counters['evidence_messages']}\n"
-                f"Review cycle: {task.review_cycle} | Fix cycles: {task.fix_cycles} | Evidence cycles: {task.evidence_cycles} | Local batches: {counters['local_evidence_batches']}\n"
-                f"READY FOR OWNER REVIEW: {'YES' if task.ready_for_owner_review else 'NO'}\n"
-                f"{task.error_code or ''} {task.reason or ''}\n{task.context or ''}")
+            self.summary.setText(f"Công việc: {task.task_id} — {task.title}\nTrạng thái: {state_text(task.state)}\nĐặc tả: {task_spec_path(task.task_id)}\n"
+                f"Nhánh: {task_branch_name(task.task_id)}\nBase SHA: {task.base_sha or 'Chưa commit'}\nCandidate SHA: {task.candidate_sha or 'Không có'}\n"
+                f"Remote SHA: {publication['github_last_remote_sha'] if publication else 'Không có'}\n"
+                f"Codex: {state_text(record.worker_last_turn_status) or 'Chưa bắt đầu'} | thread: {record.worker_thread_id or 'Không có'} | lượt: {counters['worker_initial_turns'] + counters['worker_fix_turns'] + counters.get('worker_continuation_turns', 0) + counters.get('worker_manual_turns', 0)}\n"
+                f"GitHub: {state_text(publication['github_publish_status']) if publication else 'Chưa đồng bộ'} | PR: {(publication['github_pr_url'] or 'Không có') if publication else 'Không có'}\n"
+                f"ChatGPT: {state_text(task.state)} | tin nhắn review: {counters['review_messages']} | tin nhắn kiểm chứng: {counters['evidence_messages']}\n"
+                f"Vòng review: {task.review_cycle} | Số vòng sửa: {task.fix_cycles} | Số vòng kiểm chứng: {task.evidence_cycles} | Lượt kiểm chứng local: {counters['local_evidence_batches']}\n"
+                f"SẴN SÀNG ĐỂ OWNER DUYỆT: {'CÓ' if task.ready_for_owner_review else 'CHƯA'}\n"
+                f"{task.error_code or ''} {detail_text(task.reason) or ''}\n{task.context or ''}")
             self.spec.setPlainText(task.spec)
             self.timeline.setPlainText("\n".join(f"{e['created_at']} {e['kind']} {e['payload_json']}" for e in events[-1000:]))
         else:
-            self.summary.setText("No Tasks. Create one to commit its canonical specification.")
+            self.summary.setText("Chưa có công việc. Tạo công việc để lưu đặc tả gốc thành commit.")
             self.spec.clear()
             self.timeline.clear()
             self.worker_identity.clear()
@@ -224,7 +226,7 @@ class TaskWindow(QMainWindow):
                 controller.close()
         self.recovery_button.setVisible(self.recovery is not None)
         self.recovery_button.setEnabled(self.recovery is not None and not self.busy)
-        self.recovery_button.setText(self.recovery.value if self.recovery else "")
+        self.recovery_button.setText(recovery_text(self.recovery) if self.recovery else "")
 
     def valid_approval(self, request):
         """GUI-side revalidation before showing AND returning an Owner decision."""
@@ -269,15 +271,15 @@ class TaskWindow(QMainWindow):
         identity, action = self.selected_worker(), self.recovery
         instruction = None
         if action is RecoveryAction.CONTINUE_WORKER:
-            instruction, accepted = QInputDialog.getMultiLineText(self, action.value,
-                f"Instruction for {identity.task_id}, same Codex thread {identity.worker_thread_id}.")
+            instruction, accepted = owner_input(self, recovery_text(action),
+                f"Chỉ dẫn cho {identity.task_id}, giữ nguyên Codex thread {identity.worker_thread_id}.")
             if not accepted:
                 return
         def work():
             controller = self.factory()
             async def execute():
                 if recovery_action(controller, identity) is not action:
-                    raise ValueError("Recovery is no longer available; Task remains paused.")
+                    raise ValueError("Không còn đủ điều kiện khôi phục; công việc vẫn tạm dừng.")
                 if action is RecoveryAction.CHECK_WORKER:
                     return await controller.reconcile_interrupted_continuation(identity)
                 if action is RecoveryAction.CONTINUE_WORKER:
@@ -301,7 +303,7 @@ class TaskWindow(QMainWindow):
         controller = self.factory()
         try:
             view = controller.open_worker(self.task_id)
-            self.message.setText(f"Opened worker {view.identity.task_id}: {view.identity.worker_thread_id or 'Not started'}. Activity is shown below.")
+            self.message.setText(f"Đã mở Worker {view.identity.task_id}: {view.identity.worker_thread_id or 'Chưa bắt đầu'}. Xem hoạt động bên dưới.")
         except Exception as exc:
             self.message.setText(f"{getattr(exc, 'code', 'WORKER_SELECTION_FAILED')}: {exc}")
         finally:
@@ -313,7 +315,7 @@ class TaskWindow(QMainWindow):
         controller = self.factory()
         try:
             view = controller.request_worker_pause(identity)
-            self.message.setText(f"{identity.task_id}: {view.status.value}")
+            self.message.setText(f"{identity.task_id}: {state_text(view.status)}")
         except Exception as exc:
             self.message.setText(f"{getattr(exc, 'code', 'OWNER_STEER_NOT_SAFE')}: {exc}")
         finally:
@@ -322,8 +324,8 @@ class TaskWindow(QMainWindow):
 
     def manual_instruction(self):
         identity = self.selected_worker()  # Capture selection before the dialog/job.
-        text, accepted = QInputDialog.getMultiLineText(self, "Send Manual Instruction",
-            f"Owner instruction to {identity.task_id}, exact thread {identity.worker_thread_id}. Auto Relay stays paused.")
+        text, accepted = owner_input(self, "Gửi chỉ dẫn thủ công",
+            f"Chỉ dẫn của Owner cho {identity.task_id}, đúng thread {identity.worker_thread_id}. Tự động vẫn tạm dừng.")
         if not accepted:
             return
         def work():
@@ -358,7 +360,7 @@ class TaskWindow(QMainWindow):
     def finished(self, result, error):
         self.busy, self._job, self.running_task_id = False, None, None
         self.message.setText(f"{getattr(error, 'code', 'TASK_SETUP_FAILED')}: {error}" if error else
-            f"Task state: {getattr(result, 'state', 'Updated')}. {getattr(result, 'error_code', None) or ''}")
+            f"Trạng thái công việc: {state_text(getattr(result, 'state', 'Đã cập nhật'))}. {getattr(result, 'error_code', None) or ''}")
         self.refresh()
 
     def new_task(self):
@@ -391,17 +393,17 @@ class TaskWindow(QMainWindow):
     def pause(self):
         with ControllerStore(self.root) as store:
             store.control(self.project_id, self.task_id, "PAUSE")
-        self.message.setText("Pause requested. The current effect may finish; no next effect starts after its safe checkpoint.")
+        self.message.setText("Đã yêu cầu tạm dừng. Thao tác hiện tại có thể hoàn tất; thao tác tiếp theo sẽ chờ tại điểm dừng an toàn.")
 
     def stop(self):
         with ControllerStore(self.root) as store:
             store.control(self.project_id, self.task_id, "STOP")
         if not self.busy:
             self.start(True)
-        self.message.setText("Stop requested. A dispatched effect is never undone or automatically repeated.")
+        self.message.setText("Đã yêu cầu dừng. Thao tác đã bắt đầu sẽ không bị hoàn tác hoặc tự động lặp lại.")
 
     def owner_decision(self):
-        text, accepted = QInputDialog.getMultiLineText(self, "Explicit Owner Decision", "Owner input is sent to the reviewer for this same candidate; it is not a direct worker command.")
+        text, accepted = owner_input(self, "Quyết định của Owner", "Ý kiến của Owner được gửi cho Reviewer về cùng candidate này, không gửi trực tiếp thành lệnh cho Worker.")
         if not accepted:
             return
         task_id = self.task_id
@@ -417,7 +419,7 @@ class TaskWindow(QMainWindow):
     def closeEvent(self, event):
         self.approvals.cancel_pending()
         if self.busy:
-            self.message.setText("Stop or pause the Task and wait for its current operation before closing.")
+            self.message.setText("Dừng hoặc tạm dừng công việc, rồi chờ thao tác hiện tại hoàn tất trước khi đóng.")
             event.ignore()
         else:
             self.timer.stop()

@@ -34,6 +34,9 @@ from reviewrelay.reviewer.errors import LoginRequired
 from reviewrelay.storage import PortableDataRoot
 from reviewrelay.task_ui import TaskWindow
 from reviewrelay.ui import ProjectHub
+from reviewrelay.ui import CreateProjectDialog, GitHubSetupDialog, RuntimeDialog, ReviewerDialog
+from reviewrelay.task_ui import NewTaskDialog
+from reviewrelay.ui_text import recovery_text
 from reviewrelay.worker.base import CodexWorkerSettings
 from reviewrelay.worker.codex_app_server import build_app_server_command
 from reviewrelay.worker.transport import AppServerTransport
@@ -191,6 +194,26 @@ class UiProbe:
             if not self.window.task_windows:
                 raise ValueError("Production Tasks window did not open")
             task_window = self.window.task_windows[-1]
+            if (self.window.windowTitle() != "ReviewRelay — Dự án"
+                    or self.window.create_button.text() != "+ Thêm dự án"
+                    or task_window.windowTitle() != "ReviewRelay — Công việc"
+                    or task_window.manual_button.text() != "Gửi chỉ dẫn thủ công"):
+                raise ValueError("Vietnamese Hub/Task UI differs")
+            project = self.window.selected()
+            dialogs = ((CreateProjectDialog(self.window), "Thêm / Nhập dự án"),
+                (GitHubSetupDialog(project, parent=self.window), "Thiết lập GitHub"),
+                (RuntimeDialog(project, self.window), "Kết nối Codex Runtime"),
+                (ReviewerDialog(project, self.window), "Kết nối ChatGPT Reviewer"),
+                (NewTaskDialog(task_window), "Tạo công việc mới"))
+            for index, (dialog, title) in enumerate(dialogs):
+                dialog.show()
+                self.app.processEvents()
+                if dialog.windowTitle() != title:
+                    raise ValueError("Vietnamese setup dialog differs")
+                dialog.grab().save(str(self.output.with_suffix(f".dialog-{index}.png")))
+                dialog.reject()
+                dialog.deleteLater()
+            self.result["vietnamese_dialogs"] = [title for _, title in dialogs]
             if self.config["task_id"] not in task_window.summary.text():
                 raise ValueError("Task state not rendered")
             if "WORKER_THREAD_ID=" not in task_window.worker_identity.text() or not task_window.timeline.toPlainText():
@@ -281,12 +304,16 @@ class UiProbe:
             dialog = self.window.approvals.dialog
             if dialog.thread() != self.app.thread() or QThread.currentThread() != self.app.thread():
                 raise ValueError("Approval dialog is not on the GUI thread")
-            for label, key in (("Project", "project_id"), ("Task", "task_id"), ("Codex thread", "thread_id"),
-                    ("Turn", "turn_id"), ("cwd", "cwd")):
+            for label, key in (("Dự án", "project_id"), ("Công việc", "task_id"), ("Codex thread", "thread_id"),
+                    ("Lượt", "turn_id"), ("cwd", "cwd")):
                 if f"{label}: {self.request[key]}" not in dialog.metadata.text():
                     raise ValueError("Approval metadata differs")
             if dialog.command.toPlainText() != self.request["command"] or dialog.findChildren(QCheckBox):
                 raise ValueError("Command/options differ")
+            if (dialog.windowTitle() != "Cho phép chạy lệnh này?" or
+                    [dialog.accept_once.text(), dialog.decline.text(), dialog.cancel.text()]
+                    != ["Cho phép một lần", "Từ chối", "Hủy"]):
+                raise ValueError("Vietnamese approval UI differs")
             if self.step == 0:
                 dialog.grab().save(str(self.output.with_suffix(".approval.png")))
             choice = choices[self.step]
@@ -303,7 +330,8 @@ class UiProbe:
                 ([method] if i == 1 else [method, "run"])]
             if self.calls != expected:
                 raise ValueError(f"Recovery wiring differs: {self.calls}")
-            self.result.update(actions=[a.value for a in actions], calls=self.calls)
+            self.result.update(actions=[a.value for a in actions], calls=self.calls,
+                display_labels=[recovery_text(a) for a in actions])
             self.finish()
             return
         action = actions[self.step]
@@ -326,15 +354,17 @@ class UiProbe:
             self.window.close()
         self.window = TaskWindow(self.root, request["project_id"], controller_factory=lambda: ProbeController(self.root, request["project_id"]))
         self.window.show()
-        if self.window.recovery is not action or not self.window.recovery_button.isVisible():
+        if (self.window.recovery is not action or not self.window.recovery_button.isVisible()
+                or self.window.recovery_button.text() != recovery_text(action)):
             raise ValueError("Contextual recovery action was not rendered")
         self.window.grab().save(str(self.output.with_suffix(f".recovery-{self.step}.png")))
-        previous = QInputDialog.getMultiLineText
+        import reviewrelay.task_ui as task_ui
+        previous = task_ui.owner_input
         try:
-            QInputDialog.getMultiLineText = lambda *a, **kw: ("Harmless fixture instruction; no worker runs", True)
+            task_ui.owner_input = lambda *a, **kw: ("Harmless fixture instruction; no worker runs", True)
             self.window.recovery_button.click()
         finally:
-            QInputDialog.getMultiLineText = previous
+            task_ui.owner_input = previous
         self.step += 1
 
     def run(self):

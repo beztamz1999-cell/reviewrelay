@@ -45,7 +45,7 @@ def test_new_task_contract_defaults_and_explicit_test_registry(app):
     dialog.task_id.setText("TASK-UI")
     dialog.title.setText("Harmless task")
     dialog.spec.setPlainText("Create the requested harmless file.")
-    assert ok.isEnabled() and "Commit Task Specification" in ok.text()
+    assert ok.isEnabled() and "Tạo công việc" in ok.text()
     values = dialog.values()
     assert values["require_changes"] and not values["allow_spec_change"]
     assert values["max_fix_cycles"] == 3 and values["max_evidence_cycles"] == 5
@@ -81,9 +81,9 @@ def test_new_task_ui_commits_spec_without_worker_then_start_runs_complete(window
     assert window.start_button.isEnabled() and not window.owner_button.isEnabled()
     window.start_button.click()
     spin(app, lambda: not window.busy, timeout=120)
-    assert "State: COMPLETE" in window.summary.text()
-    assert "READY FOR OWNER REVIEW: YES" in window.summary.text()
-    for label in ("Base SHA:", "Candidate SHA:", "Remote SHA:", "Codex:", "GitHub:", "ChatGPT:", "Local batches:"):
+    assert "Trạng thái: Hoàn tất" in window.summary.text()
+    assert "SẴN SÀNG ĐỂ OWNER DUYỆT: CÓ" in window.summary.text()
+    for label in ("Base SHA:", "Candidate SHA:", "Remote SHA:", "Codex:", "GitHub:", "ChatGPT:", "Lượt kiểm chứng local:"):
         assert label in window.summary.text()
     assert "GITHUB_PUSH_STARTED" in window.timeline.toPlainText()
     assert "TASK_COMPLETED" in window.timeline.toPlainText()
@@ -130,7 +130,7 @@ def test_ui_continuation_turn_count_uses_all_durable_worker_counters(window, h, 
         "worker_fix_turns": 2, "worker_continuation_turns": 4, "worker_manual_turns": 1}), "fixture")
     c.close()
     window.refresh()
-    assert "| turns: 8\n" in window.summary.text()
+    assert "| lượt: 8\n" in window.summary.text()
 
 
 def test_owner_question_visible_and_explicit_input_only_routes_to_reviewer(window, h, app, monkeypatch):
@@ -141,10 +141,10 @@ def test_owner_question_visible_and_explicit_input_only_routes_to_reviewer(windo
     window.refresh()
     assert "Owner question" in window.summary.text() and "Visible context" in window.summary.text()
     assert window.owner_button.isEnabled() and not window.start_button.isEnabled()
-    monkeypatch.setattr(QInputDialog, "getMultiLineText", lambda *args: ("Keep the approved scope", True))
+    monkeypatch.setattr("reviewrelay.task_ui.owner_input", lambda *args: ("Keep the approved scope", True))
     window.owner_button.click()
     spin(app, lambda: not window.busy, timeout=120)
-    assert "State: COMPLETE" in window.summary.text()
+    assert "Trạng thái: Hoàn tất" in window.summary.text()
     assert h.initial == 1 and h.fixes == 0 and h.sends == 2
     assert "Keep the approved scope" in h.notifications[-1]["prompt"]
 
@@ -169,29 +169,35 @@ def test_stop_from_owner_pause_is_terminal_without_new_calls(window, h, app):
     window.refresh()
     window.stop_button.click()
     spin(app, lambda: not window.busy, timeout=120)
-    assert "State: STOPPED" in window.summary.text()
+    assert "Trạng thái: Đã dừng" in window.summary.text()
     assert h.initial == h.sends == 1 and h.fixes == 0
 
 
 def test_worker_panel_exact_identity_open_pause_manual_and_resume(window, h, app, monkeypatch):
+    assert window.windowTitle() == "ReviewRelay — Công việc"
+    assert [b.text() for b in (window.start_button, window.pause_button, window.resume_button,
+        window.stop_button, window.owner_button)] == ["Bắt đầu", "Tạm dừng", "Tiếp tục", "Dừng", "Quyết định của Owner"]
+    assert [b.text() for b in (window.open_worker_button, window.pause_auto_button,
+        window.manual_button, window.resume_auto_button)] == ["Xem Worker", "Tạm dừng tự động",
+        "Gửi chỉ dẫn thủ công", "Tiếp tục tự động"]
     c, task = h.create()
     assert run(c.run(task.task_id)).state is S.COMPLETE
     identity = c.open_worker(task.task_id).identity
     c.close()
     h.manual_no_commit = True
     window.refresh()
-    assert window.tasks.item(0).text() == task.task_id + " — COMPLETE"
+    assert window.tasks.item(0).text() == task.task_id + " — Hoàn tất"
     for field, value in (("PROJECT_ID", identity.project_id), ("TASK_ID", identity.task_id),
             ("WORKER_THREAD_ID", identity.worker_thread_id), ("REPOSITORY", identity.repository),
             ("TASK_BRANCH", identity.task_branch)):
         assert f"{field}={value}" in window.worker_identity.text()
     window.open_worker_button.click()
-    assert "Opened worker" in window.message.text()
+    assert "Đã mở Worker" in window.message.text()
     window.pause_auto_button.click()
-    assert "PAUSED_OWNER_STEER" in window.tasks.item(0).text()
+    assert "Owner đang điều khiển" in window.tasks.item(0).text()
     assert window.manual_button.isEnabled() and window.resume_auto_button.isEnabled()
     assert not window.resume_button.isEnabled()
-    monkeypatch.setattr(QInputDialog, "getMultiLineText", lambda *args: ("Inspect only this selected Task", True))
+    monkeypatch.setattr("reviewrelay.task_ui.owner_input", lambda *args: ("Inspect only this selected Task", True))
     window.manual_button.click()
     spin(app, lambda: not window.busy, timeout=120)
     assert h.manuals[0][0] == task.task_id and h.initial == h.sends == 1 and h.fixes == 0
@@ -199,7 +205,7 @@ def test_worker_panel_exact_identity_open_pause_manual_and_resume(window, h, app
     assert identity.worker_thread_id in window.worker_identity.text()
     window.resume_auto_button.click()
     spin(app, lambda: not window.busy, timeout=120)
-    assert "State: COMPLETE" in window.summary.text()
+    assert "Trạng thái: Hoàn tất" in window.summary.text()
     assert h.initial == h.sends == 1 and len(h.manuals) == 1
 
 
@@ -214,7 +220,7 @@ def test_worker_panel_project_scoping_and_selected_task_only(window, h, app, mon
     window.refresh()
     assert window.tasks.count() == 2
     h.manual_no_commit = True
-    monkeypatch.setattr(QInputDialog, "getMultiLineText", lambda *args: ("Inspect only", True))
+    monkeypatch.setattr("reviewrelay.task_ui.owner_input", lambda *args: ("Inspect only", True))
     for row, task in enumerate((a, b)):
         git(h.repo, "switch", "-c", "ui-execution-" + task.task_id, task.candidate_sha)
         window.tasks.setCurrentRow(row)
@@ -233,7 +239,7 @@ def test_worker_pending_typed_status_disables_manual_action(window, h, app):
     c.close()
     window.refresh()
     window.pause_auto_button.click()
-    assert "PAUSE_PENDING" in window.tasks.item(0).text()
+    assert "Đang chờ điểm dừng an toàn" in window.tasks.item(0).text()
     assert not window.manual_button.isEnabled() and not window.resume_auto_button.isEnabled()
 
 
@@ -248,7 +254,7 @@ def test_manual_job_keeps_original_selection_when_owner_selects_other_worker(win
     window.refresh()
     window.tasks.setCurrentRow(0)
     window.pause_auto_button.click()
-    monkeypatch.setattr(QInputDialog, "getMultiLineText", lambda *args: ("Keep captured selection", True))
+    monkeypatch.setattr("reviewrelay.task_ui.owner_input", lambda *args: ("Keep captured selection", True))
     captured = []
     monkeypatch.setattr(window, "start_job", lambda work, task_id: captured.append((work, task_id)))
     window.manual_button.click()

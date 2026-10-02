@@ -12,6 +12,7 @@ from reviewrelay.approval_ui import CommandApprovalDialog
 from reviewrelay.controller_store import ControllerState as S, ControllerStore
 from reviewrelay.owner_recovery import RecoveryAction as R, recovery_action
 from reviewrelay.task_ui import TaskWindow
+from reviewrelay.ui_text import recovery_text
 from test_controller import h, git, run
 from test_project_ui import app
 from test_task_ui import window, spin
@@ -69,11 +70,11 @@ def test_real_queued_background_approval_metadata_and_choices(window, h, app, mo
     dialog = window.approvals.dialog
     assert created == [(threading.get_ident(), app.thread())]
     assert dialog.command.toPlainText() == request["command"]
-    for label, key in (("Project", "project_id"), ("Task", "task_id"), ("Codex thread", "thread_id"),
-            ("Turn", "turn_id"), ("cwd", "cwd")):
+    for label, key in (("Dự án", "project_id"), ("Công việc", "task_id"), ("Codex thread", "thread_id"),
+            ("Lượt", "turn_id"), ("cwd", "cwd")):
         assert f"{label}: {request[key]}" in dialog.metadata.text()
     assert not dialog.findChildren(QCheckBox)
-    assert [dialog.accept_once.text(), dialog.decline.text(), dialog.cancel.text()] == ["Accept once", "Decline", "Cancel"]
+    assert [dialog.accept_once.text(), dialog.decline.text(), dialog.cancel.text()] == ["Cho phép một lần", "Từ chối", "Hủy"]
     if choice == "close":
         dialog.close()
     elif choice == "window_close":
@@ -168,13 +169,13 @@ def test_continue_worker_ui_uses_exact_identity_and_normal_candidate_path(window
     c.close()
     window.refresh()
     assert window.recovery is R.CONTINUE_WORKER and window.recovery_button.isVisible()
-    assert window.recovery_button.text() == "Continue Same Worker" and not window.resume_button.isEnabled()
+    assert window.recovery_button.text() == "Tiếp tục Worker hiện tại" and not window.resume_button.isEnabled()
     calls = track_recovery(monkeypatch, "continue_incomplete_worker")
-    monkeypatch.setattr(QInputDialog, "getMultiLineText", lambda *args: ("Finish this Task and commit the tested work", True))
+    monkeypatch.setattr("reviewrelay.task_ui.owner_input", lambda *args: ("Finish this Task and commit the tested work", True))
     h.worker_fault = None
     window.recovery_button.click()
     spin(app, lambda: not window.busy, timeout=120)
-    assert calls == [identity] and "State: COMPLETE" in window.summary.text()
+    assert calls == [identity] and "Trạng thái: Hoàn tất" in window.summary.text()
     assert h.initial == h.continuations == h.sends == 1
     assert set(h.thread_ids) == {identity.worker_thread_id}
     assert not window.recovery_button.isVisible()
@@ -205,7 +206,7 @@ def test_unproven_terminal_worker_remains_paused(window, h, app):
     window.refresh()
     window.recovery_button.click()
     spin(app, lambda: not window.busy, timeout=120)
-    assert "State: PAUSED_ERROR" in window.summary.text()
+    assert "Trạng thái: Tạm dừng do lỗi" in window.summary.text()
     assert "WORKER_TURN_AMBIGUOUS" in window.message.text()
     assert h.initial == h.continuations == 1 and h.sends == 0
 
@@ -230,12 +231,12 @@ def test_review_ui_routes_reconciliation_before_controller_run(window, h, app, m
     c.close()
     h.review_fault = None
     window.refresh()
-    assert window.recovery is action and window.recovery_button.text() == action.value
+    assert window.recovery is action and window.recovery_button.text() == recovery_text(action)
     calls = track_recovery(monkeypatch, method)
     pushes, sends = h.publisher_events.count("GITHUB_PUSH_IN_FLIGHT"), h.sends
     window.recovery_button.click()
     spin(app, lambda: not window.busy, timeout=120)
-    assert calls == [identity] and "State: COMPLETE" in window.summary.text()
+    assert calls == [identity] and "Trạng thái: Hoàn tất" in window.summary.text()
     assert h.sends == sends + (0 if visible else 1) and h.initial == 1
     assert h.publisher_events.count("GITHUB_PUSH_IN_FLIGHT") == pushes
 
@@ -249,7 +250,7 @@ def test_runtime_recovery_proof_failure_stays_paused_and_never_sends(window, h, 
     h.review_fault = fault
     window.recovery_button.click()
     spin(app, lambda: not window.busy, timeout=120)
-    assert "State: PAUSED_ERROR" in window.summary.text() and h.sends == sends
+    assert "Trạng thái: Tạm dừng do lỗi" in window.summary.text() and h.sends == sends
     assert "REVIEWER_CONVERSATION_CHANGED" in window.message.text()
 
 
@@ -273,7 +274,7 @@ def test_unproven_review_has_no_generic_retry(window, h, app, mutation):
     c.close()
     window.refresh()
     assert window.recovery is None and not window.recovery_button.isVisible() and not window.resume_button.isEnabled()
-    assert "State: PAUSED_ERROR" in window.summary.text()
+    assert "Trạng thái: Tạm dừng do lỗi" in window.summary.text()
 
 
 @pytest.mark.parametrize("state", [S.READY, S.COMPLETE, S.WAITING_REVIEW])
@@ -289,12 +290,12 @@ def test_queued_recovery_rechecks_state_and_captured_identity(window, h, app, mo
     c, blocked, identity = dirty_worker(h)
     window.refresh()
     captured = []
-    monkeypatch.setattr(QInputDialog, "getMultiLineText", lambda *args: ("Finish same Task", True))
+    monkeypatch.setattr("reviewrelay.task_ui.owner_input", lambda *args: ("Finish same Task", True))
     monkeypatch.setattr(window, "start_job", lambda work, task_id: captured.append((work, task_id)))
     window.recovery_button.click()
     assert captured[0][1] == identity.task_id
     c.store.put_effect(blocked, "unresolved", "REVIEW_SEND", "AMBIGUOUS", {})
     c.close()
-    with pytest.raises(ValueError, match="no longer available"):
+    with pytest.raises(ValueError, match="Không còn đủ điều kiện khôi phục"):
         captured[0][0]()
     assert h.continuations == h.sends == 0

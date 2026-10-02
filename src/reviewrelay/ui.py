@@ -7,11 +7,12 @@ import asyncio
 from PySide6.QtCore import QObject, QRunnable, QThreadPool, Qt, Signal, Slot
 from PySide6.QtWidgets import (QApplication, QButtonGroup, QComboBox, QDialog, QDialogButtonBox,
     QFileDialog, QFormLayout, QHBoxLayout, QLabel, QLineEdit, QListWidget, QListWidgetItem,
-    QMainWindow, QMessageBox, QPushButton, QRadioButton, QTextEdit, QVBoxLayout, QWidget)
+    QInputDialog, QMainWindow, QMessageBox, QPushButton, QRadioButton, QTextEdit, QVBoxLayout, QWidget)
 
 from .project_setup import ProjectSetupService
 from .projects import ConnectionStatus, ProjectKind, ProjectRegistry
 from .storage import PortableDataRoot
+from .ui_text import state_text
 
 
 class JobSignals(QObject):
@@ -31,23 +32,50 @@ class Job(QRunnable):
             self.signals.finished.emit(None, exc)
 
 
-def dialog_buttons(dialog, action="Save"):
+def dialog_buttons(dialog, action="Lưu"):
     buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
     buttons.button(QDialogButtonBox.StandardButton.Ok).setText(action)
+    buttons.button(QDialogButtonBox.StandardButton.Cancel).setText("Hủy")
     buttons.accepted.connect(dialog.accept)
     buttons.rejected.connect(dialog.reject)
     return buttons
 
 
+def explanation(text):
+    label = QLabel(text)
+    label.setWordWrap(True)
+    return label
+
+
+def owner_input(parent, title, label):
+    dialog = QInputDialog(parent)
+    dialog.setWindowTitle(title)
+    dialog.setLabelText(label)
+    dialog.setOption(QInputDialog.InputDialogOption.UsePlainTextEditForTextInput)
+    dialog.setOkButtonText("Gửi")
+    dialog.setCancelButtonText("Hủy")
+    accepted = dialog.exec() == QDialog.DialogCode.Accepted
+    return dialog.textValue(), accepted
+
+
+def confirm_question(parent, title, text):
+    box = QMessageBox(QMessageBox.Icon.Question, title, text,
+        QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No, parent)
+    box.button(QMessageBox.StandardButton.Yes).setText("Có")
+    box.button(QMessageBox.StandardButton.No).setText("Không")
+    box.setDefaultButton(QMessageBox.StandardButton.No)
+    return box.exec()
+
+
 class CreateProjectDialog(QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("Create / Import Project")
+        self.setWindowTitle("Thêm / Nhập dự án")
         self.resize(580, 370)
         layout = QVBoxLayout(self)
-        layout.addWidget(QLabel("First choose a project type:"))
-        self.new = QRadioButton("New Project — empty local folder")
-        self.existing = QRadioButton("Existing Project — inspect a local folder")
+        layout.addWidget(QLabel("Chọn loại dự án:"))
+        self.new = QRadioButton("Dự án mới — thư mục local trống")
+        self.existing = QRadioButton("Dự án có sẵn — chọn thư mục local")
         self.kind_group = QButtonGroup(self)
         self.kind_group.addButton(self.new)
         self.kind_group.addButton(self.existing)
@@ -58,19 +86,19 @@ class CreateProjectDialog(QDialog):
         row = QWidget()
         folder_layout = QHBoxLayout(row)
         folder_layout.setContentsMargins(0, 0, 0, 0)
-        browse = QPushButton("Browse…")
+        browse = QPushButton("Chọn…")
         browse.clicked.connect(self.browse)
         folder_layout.addWidget(self.folder)
         folder_layout.addWidget(browse)
-        form.addRow("Project name", self.name)
-        form.addRow("Local folder", row)
-        form.addRow("Initial branch (when initializing)", self.branch)
+        form.addRow("Tên dự án", self.name)
+        form.addRow("Thư mục dự án", row)
+        form.addRow("Nhánh khởi tạo", self.branch)
         layout.addLayout(form)
         self.github_choice = QComboBox()
-        self.github_choice.addItems(["Choose GitHub setup…", "Create New GitHub Repository", "Link Existing GitHub Repository"])
+        self.github_choice.addItems(["Chọn cách kết nối GitHub…", "Tạo repository GitHub mới", "Liên kết repository GitHub có sẵn"])
         layout.addWidget(self.github_choice)
-        layout.addWidget(QLabel("Existing folders are inspected first. Snapshot and GitHub actions require separate confirmation."))
-        self.buttons = dialog_buttons(self, "Continue")
+        layout.addWidget(explanation("Thư mục có sẵn được kiểm tra trước. Tạo commit ban đầu và thao tác GitHub cần xác nhận riêng."))
+        self.buttons = dialog_buttons(self, "Tiếp tục")
         layout.addWidget(self.buttons)
         for edit in (self.name, self.folder):
             edit.textChanged.connect(self.validate)
@@ -80,7 +108,7 @@ class CreateProjectDialog(QDialog):
         self.validate()
 
     def browse(self):
-        folder = QFileDialog.getExistingDirectory(self, "Select local project folder")
+        folder = QFileDialog.getExistingDirectory(self, "Chọn thư mục dự án")
         if folder:
             self.folder.setText(folder)
 
@@ -97,40 +125,40 @@ class CreateProjectDialog(QDialog):
 class GitHubSetupDialog(QDialog):
     def __init__(self, project, remotes=(), parent=None, initial_choice=0):
         super().__init__(parent)
-        self.setWindowTitle("GitHub Repository Setup")
+        self.setWindowTitle("Thiết lập GitHub")
         self.resize(650, 490)
         layout = QVBoxLayout(self)
         self.detected = QComboBox()
-        self.detected.addItem("Choose another repository", None)
+        self.detected.addItem("Chọn repository khác", None)
         for remote in remotes:
-            self.detected.addItem(f"Detected: {remote.name} — {remote.repository_url}", remote)
-        layout.addWidget(QLabel("Detected remotes are proposals. Nothing is bound until you confirm."))
+            self.detected.addItem(f"Đã phát hiện: {remote.name} — {remote.repository_url}", remote)
+        layout.addWidget(QLabel("ReviewRelay đã phát hiện remote. Chỉ liên kết sau khi bạn xác nhận."))
         layout.addWidget(self.detected)
         self.action = QComboBox()
-        self.action.addItems(["Link Existing GitHub Repository", "Create New GitHub Repository"])
+        self.action.addItems(["Liên kết repository GitHub có sẵn", "Tạo repository GitHub mới"])
         self.action.setCurrentIndex(1 if initial_choice == 1 else 0)
         self.url = QLineEdit(project.github_repo_url or "")
         self.url.setPlaceholderText("https://github.com/owner/repository")
         self.remote = QLineEdit(project.github_remote_name)
         self.visibility = QComboBox()
-        self.visibility.addItems(["Select visibility…", "PRIVATE", "PUBLIC"])
+        self.visibility.addItems(["Chọn quyền riêng tư…", "PRIVATE", "PUBLIC"])
         self.mode = QComboBox()
         self.mode.addItems(["branch", "pr"])
         self.mode.setCurrentText(project.review_mode)
         self.sensitive = QTextEdit("\n".join(project.credential_paths))
         self.sensitive.setMaximumHeight(70)
         form = QFormLayout()
-        form.addRow("Action", self.action)
-        form.addRow("Repository URL", self.url)
-        form.addRow("Remote name", self.remote)
-        form.addRow("New repository visibility", self.visibility)
-        form.addRow("Review mode", self.mode)
-        form.addRow("Known sensitive paths (one per line)", self.sensitive)
+        form.addRow("Thao tác", self.action)
+        form.addRow("URL repository", self.url)
+        form.addRow("Tên remote", self.remote)
+        form.addRow("Quyền riêng tư repository mới", self.visibility)
+        form.addRow("Chế độ review", self.mode)
+        form.addRow("Đường dẫn nhạy cảm đã biết (mỗi dòng một đường dẫn)", self.sensitive)
         layout.addLayout(form)
-        warning = QLabel("Setup verifies history and may publish the exact initial local commit. It never force pushes, merges, rebases or resets.\nThe basic filename guard is not comprehensive secret scanning.")
+        warning = QLabel("Thiết lập sẽ kiểm tra lịch sử Git và có thể đồng bộ đúng commit local ban đầu. Không force push, merge, rebase hoặc reset.\nKiểm tra tên file cơ bản không thay thế việc rà soát toàn bộ dữ liệu bí mật.")
         warning.setWordWrap(True)
         layout.addWidget(warning)
-        self.buttons = dialog_buttons(self, "Verify and Bind Repository")
+        self.buttons = dialog_buttons(self, "Kiểm tra và liên kết")
         layout.addWidget(self.buttons)
         self.detected.currentIndexChanged.connect(self.use_detected)
         self.action.currentIndexChanged.connect(self.validate)
@@ -147,10 +175,10 @@ class GitHubSetupDialog(QDialog):
             self.url.setText(remote.repository_url)
             self.remote.setText(remote.name)
             self.action.setCurrentIndex(0)
-            self.buttons.button(QDialogButtonBox.StandardButton.Ok).setText("Use This Repository")
+            self.buttons.button(QDialogButtonBox.StandardButton.Ok).setText("Dùng repository này")
         else:
             self.remote.setText("reviewrelay")
-            self.buttons.button(QDialogButtonBox.StandardButton.Ok).setText("Verify and Bind Repository")
+            self.buttons.button(QDialogButtonBox.StandardButton.Ok).setText("Kiểm tra và liên kết")
 
     def validate(self):
         create = self.action.currentIndex() == 1
@@ -168,27 +196,27 @@ class GitHubSetupDialog(QDialog):
 class RuntimeDialog(QDialog):
     def __init__(self, project, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("Connect Codex Runtime")
+        self.setWindowTitle("Kết nối Codex Runtime")
         layout = QVBoxLayout(self)
         self.executable = QLineEdit(project.worker_settings.get("executable", ""))
         self.model = QLineEdit(project.worker_settings.get("model") or "")
         self.effort = QComboBox()
-        self.effort.addItems(["Configured default", "low", "medium", "high", "xhigh", "max", "ultra"])
+        self.effort.addItems(["Theo cấu hình Codex", "low", "medium", "high", "xhigh", "max", "ultra"])
         if project.worker_settings.get("reasoning_effort"):
             self.effort.setCurrentText(project.worker_settings["reasoning_effort"])
-        browse = QPushButton("Select executable…")
+        browse = QPushButton("Chọn file Codex…")
         browse.clicked.connect(self.browse)
         form = QFormLayout()
-        form.addRow("Tested/configured Codex executable", self.executable)
+        form.addRow("File Codex executable", self.executable)
         form.addRow(browse)
-        form.addRow("Default model (optional)", self.model)
-        form.addRow("Reasoning effort", self.effort)
+        form.addRow("Model mặc định (không bắt buộc)", self.model)
+        form.addRow("Mức suy luận", self.effort)
         layout.addLayout(form)
-        layout.addWidget(QLabel("Checks executable, app-server capability and supported login status. No thread or inference is created."))
-        layout.addWidget(dialog_buttons(self, "Check Runtime"))
+        layout.addWidget(explanation("Kiểm tra file Codex, khả năng kết nối và trạng thái đăng nhập. Không tạo thread hoặc lượt suy luận."))
+        layout.addWidget(dialog_buttons(self, "Kiểm tra Codex"))
 
     def browse(self):
-        path, _ = QFileDialog.getOpenFileName(self, "Select Codex executable")
+        path, _ = QFileDialog.getOpenFileName(self, "Chọn file Codex")
         if path:
             self.executable.setText(path)
 
@@ -200,20 +228,20 @@ class RuntimeDialog(QDialog):
 class ReviewerDialog(QDialog):
     def __init__(self, project, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("Connect ChatGPT Reviewer")
+        self.setWindowTitle("Kết nối ChatGPT Reviewer")
         layout = QVBoxLayout(self)
         self.url = QLineEdit(project.chatgpt_conversation_url or "")
         self.profile = QLineEdit(project.reviewer_settings.get("browser_profile", "reviewer-chrome"))
         form = QFormLayout()
-        form.addRow("Existing ChatGPT conversation URL", self.url)
-        form.addRow("Dedicated ReviewRelay profile", self.profile)
+        form.addRow("URL cuộc trò chuyện ChatGPT", self.url)
+        form.addRow("Profile Chrome riêng cho ReviewRelay", self.profile)
         layout.addLayout(form)
-        label = QLabel("Use the existing Phase 3 manual Auth Mode to sign in and save this exact tab, then close Chrome cleanly. The connection check attaches to the dedicated profile and verifies readiness without sending a message.")
+        label = QLabel("ReviewRelay dùng profile Chrome riêng. Bạn đăng nhập thủ công, mở đúng cuộc trò chuyện Reviewer rồi thoát Chrome bằng menu → Exit để lưu tab. ReviewRelay sẽ tự kết nối lại để kiểm tra, không gửi tin nhắn.")
         label.setWordWrap(True)
         layout.addWidget(label)
-        self.auth = QPushButton("Open Manual Auth Mode")
+        self.auth = QPushButton("Mở Chrome để đăng nhập")
         layout.addWidget(self.auth)
-        self.buttons = dialog_buttons(self, "Check Reviewer")
+        self.buttons = dialog_buttons(self, "Kiểm tra Reviewer")
         layout.addWidget(self.buttons)
 
 
@@ -222,7 +250,7 @@ class ProjectHub(QMainWindow):
         super().__init__()
         self.root = root.create()
         self.service_factory = service_factory or (lambda: ProjectSetupService(root))
-        self.setWindowTitle("ReviewRelay — Projects")
+        self.setWindowTitle("ReviewRelay — Dự án")
         self.resize(1020, 640)
         self.pool = QThreadPool(self)
         self.pool.setMaxThreadCount(1)
@@ -233,9 +261,9 @@ class ProjectHub(QMainWindow):
         widget = QWidget()
         outer = QVBoxLayout(widget)
         header = QHBoxLayout()
-        header.addWidget(QLabel("ReviewRelay — Project Hub"))
+        header.addWidget(QLabel("ReviewRelay — Quản lý dự án"))
         header.addStretch()
-        self.create_button = QPushButton("+ Create Project")
+        self.create_button = QPushButton("+ Thêm dự án")
         self.create_button.clicked.connect(self.create_project)
         header.addWidget(self.create_button)
         outer.addLayout(header)
@@ -246,10 +274,10 @@ class ProjectHub(QMainWindow):
         body.addWidget(self.projects)
         detail = QWidget()
         details = QVBoxLayout(detail)
-        self.heading = QLabel("Select or create a Project")
+        self.heading = QLabel("Chọn hoặc thêm dự án")
         details.addWidget(self.heading)
         self.name = QLineEdit()
-        self.rename_button = QPushButton("Rename Project")
+        self.rename_button = QPushButton("Đổi tên dự án")
         self.rename_button.clicked.connect(self.rename_project)
         name_row = QHBoxLayout()
         name_row.addWidget(self.name)
@@ -261,14 +289,14 @@ class ProjectHub(QMainWindow):
             label.setWordWrap(True)
             label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
             details.addWidget(label)
-        self.initialize_button = QPushButton("Initialize Git Repository")
-        self.snapshot_button = QPushButton("Preview Initial Git Snapshot")
-        self.github_button = QPushButton("Detect / Create / Link GitHub")
-        self.reviewer_button = QPushButton("Connect Reviewer")
-        self.codex_button = QPushButton("Connect Codex Worker Runtime")
-        self.refresh_button = QPushButton("Inspect Local Repository")
-        self.unregister_button = QPushButton("Unregister Project")
-        self.tasks_button = QPushButton("Tasks / + New Task")
+        self.initialize_button = QPushButton("Khởi tạo repository Git")
+        self.snapshot_button = QPushButton("Xem trước commit Git ban đầu")
+        self.github_button = QPushButton("Kết nối GitHub")
+        self.reviewer_button = QPushButton("Kết nối ChatGPT Reviewer")
+        self.codex_button = QPushButton("Kết nối Codex Worker")
+        self.refresh_button = QPushButton("Kiểm tra repository local")
+        self.unregister_button = QPushButton("Gỡ dự án khỏi ReviewRelay")
+        self.tasks_button = QPushButton("Công việc / + Tạo công việc")
         for button, callback in ((self.initialize_button, self.initialize_git), (self.snapshot_button, self.preview_snapshot),
             (self.github_button, self.configure_github), (self.reviewer_button, self.configure_reviewer),
             (self.codex_button, self.configure_codex), (self.refresh_button, self.inspect_project), (self.unregister_button, self.unregister_project), (self.tasks_button, self.open_tasks)):
@@ -277,7 +305,7 @@ class ProjectHub(QMainWindow):
         details.addStretch()
         body.addWidget(detail, 1)
         outer.addLayout(body)
-        self.message = QLabel("Repository setup comes before reviewer and worker connection.")
+        self.message = QLabel("Thiết lập repository trước khi kết nối Reviewer và Worker.")
         self.message.setTextFormat(Qt.TextFormat.PlainText)
         self.message.setWordWrap(True)
         outer.addWidget(self.message)
@@ -321,27 +349,27 @@ class ProjectHub(QMainWindow):
         self.projects.setEnabled(not self.busy)
         self.name.setEnabled(not self.busy and project is not None)
         if not project:
-            self.heading.setText("Select or create a Project")
+            self.heading.setText("Chọn hoặc thêm dự án")
             self.name.clear()
             for label in (self.local_label, self.github_label, self.reviewer_label, self.codex_label):
                 label.clear()
             return
-        self.heading.setText("Project Status: " + project.status)
+        self.heading.setText("Trạng thái dự án: " + state_text(project.status))
         self.name.setText(project.project_name)
-        self.local_label.setText(f"Local Repository: {project.local_status.value}\n{project.local_repo_path}")
-        relationship = project.setup.get("relationship", "Not yet verified")
-        self.github_label.setText(f"GitHub: {project.github_status.value}\n{project.github_repo_url or 'Not configured'}\nHistory relationship: {relationship}")
-        self.reviewer_label.setText(f"ChatGPT Reviewer: {project.chatgpt_status.value}\n{project.chatgpt_conversation_url or 'Not configured'}")
-        self.codex_label.setText(f"Codex Worker: {project.codex_status.value}\n{project.worker_settings.get('executable') or 'Not configured'}")
+        self.local_label.setText(f"Repository local: {state_text(project.local_status)}\n{project.local_repo_path}")
+        relationship = state_text(project.setup.get("relationship", "Chưa kiểm tra"))
+        self.github_label.setText(f"GitHub: {state_text(project.github_status)}\n{project.github_repo_url or 'Chưa thiết lập'}\nQuan hệ lịch sử Git: {relationship}")
+        self.reviewer_label.setText(f"ChatGPT Reviewer: {state_text(project.chatgpt_status)}\n{project.chatgpt_conversation_url or 'Chưa thiết lập'}")
+        self.codex_label.setText(f"Codex Worker: {state_text(project.codex_status)}\n{project.worker_settings.get('executable') or 'Chưa thiết lập'}")
         self.reviewer_button.setEnabled(not self.busy and project.repository_ready)
         self.codex_button.setEnabled(not self.busy and project.repository_ready)
         self.tasks_button.setEnabled(not self.busy and project.ready)
         self.github_button.setEnabled(not self.busy and project.local_status is ConnectionStatus.READY)
-        self.github_button.setText("Verify GitHub Binding" if project.github_last_verified_at else "Detect / Create / Link GitHub")
+        self.github_button.setText("Kiểm tra liên kết GitHub" if project.github_last_verified_at else "Kết nối GitHub")
         self.initialize_button.setEnabled(not self.busy and project.local_status is not ConnectionStatus.READY)
         self.snapshot_button.setEnabled(not self.busy and project.last_error_code == "INITIAL_SNAPSHOT_CONFIRMATION_REQUIRED")
         if not self.busy and project.last_error_code:
-            self.message.setText(project.last_error_code + ": Finish or resolve the indicated setup step.")
+            self.message.setText(project.last_error_code + ": Hoàn tất hoặc xử lý bước thiết lập được chỉ ra.")
 
     def start_job(self, label, work, callback=None):
         if self.busy:
@@ -363,7 +391,7 @@ class ProjectHub(QMainWindow):
         if error:
             self.message.setText(f"{getattr(error, 'code', 'PROJECT_SETUP_FAILED')}: {error}")
         else:
-            self.message.setText("Setup step completed. " + (getattr(result, "status", "") or ""))
+            self.message.setText("Đã hoàn tất bước thiết lập. " + state_text(getattr(result, "status", "") or ""))
         if callback:
             callback(result, error)
 
@@ -382,15 +410,15 @@ class ProjectHub(QMainWindow):
         def next_step(result, error):
             if not error and result.local_status is ConnectionStatus.READY:
                 self.configure_github(initial_choice=choice)
-        self.start_job("Preparing local Project", self.call_service("register", name, path, kind, branch=branch), next_step)
+        self.start_job("Đang chuẩn bị dự án local", self.call_service("register", name, path, kind, branch=branch), next_step)
 
     def inspect_project(self):
-        self.start_job("Inspecting local repository", self.call_service("inspect_local", self.project_id))
+        self.start_job("Đang kiểm tra repository local", self.call_service("inspect_local", self.project_id))
 
     def initialize_git(self):
-        if QMessageBox.question(self, "Initialize Git", "Initialize Git in this selected folder? No populated snapshot is staged or committed by this action.") != QMessageBox.StandardButton.Yes:
+        if confirm_question(self, "Khởi tạo Git", "Khởi tạo Git trong thư mục đã chọn? Thao tác này chưa đưa file vào commit.") != QMessageBox.StandardButton.Yes:
             return
-        self.start_job("Initializing Git", self.call_service("initialize_local", self.project_id, confirmed=True))
+        self.start_job("Đang khởi tạo Git", self.call_service("initialize_local", self.project_id, confirmed=True))
 
     def preview_snapshot(self):
         project_id = self.project_id
@@ -398,25 +426,25 @@ class ProjectHub(QMainWindow):
             if error:
                 return
             dialog = QDialog(self)
-            dialog.setWindowTitle("Review Initial Git Snapshot")
+            dialog.setWindowTitle("Kiểm tra commit Git ban đầu")
             dialog.resize(650, 500)
             layout = QVBoxLayout(dialog)
-            layout.addWidget(QLabel(f"Files discovered: {len(plan.files) + len(plan.ignored)}\nIgnored files: {len(plan.ignored)}\nFiles to be committed: {len(plan.files)}"))
+            layout.addWidget(QLabel(f"File đã tìm thấy: {len(plan.files) + len(plan.ignored)}\nFile bỏ qua: {len(plan.ignored)}\nFile sẽ commit: {len(plan.files)}"))
             listing = QTextEdit()
             listing.setReadOnly(True)
-            listing.setPlainText("FILES TO COMMIT\n" + "\n".join(plan.files) + "\n\nIGNORED\n" + "\n".join(plan.ignored))
+            listing.setPlainText("FILE SẼ COMMIT\n" + "\n".join(plan.files) + "\n\nFILE BỎ QUA\n" + "\n".join(plan.ignored))
             layout.addWidget(listing)
-            layout.addWidget(dialog_buttons(dialog, "Create Initial Git Snapshot"))
+            layout.addWidget(dialog_buttons(dialog, "Tạo commit Git ban đầu"))
             if dialog.exec() == QDialog.DialogCode.Accepted:
-                self.start_job("Creating confirmed initial snapshot", self.call_service("create_snapshot", plan, confirmed=True))
-        self.start_job("Preparing snapshot preview", self.call_service("preview_snapshot", project_id), previewed)
+                self.start_job("Đang tạo commit ban đầu đã xác nhận", self.call_service("create_snapshot", plan, confirmed=True))
+        self.start_job("Đang chuẩn bị bản xem trước", self.call_service("preview_snapshot", project_id), previewed)
 
     def configure_github(self, *, initial_choice=0):
         project = self.selected()
         if project is None:
             return
         if project.github_last_verified_at:
-            self.start_job("Verifying GitHub binding without publication", self.call_service("verify_github", project.project_id))
+            self.start_job("Đang kiểm tra liên kết GitHub, không đồng bộ code", self.call_service("verify_github", project.project_id))
             return
         def detected(remotes, error):
             if error:
@@ -427,11 +455,11 @@ class ProjectHub(QMainWindow):
             values = dialog.values()
             def confirm_public():
                 box = QMessageBox(self)
-                box.setWindowTitle("Public repository exposure")
+                box.setWindowTitle("Xác nhận repository công khai")
                 box.setIcon(QMessageBox.Icon.Warning)
-                box.setText("This repository and its committed source will be publicly accessible.")
-                confirm = box.addButton("Confirm Public Repository", QMessageBox.ButtonRole.AcceptRole)
-                box.addButton(QMessageBox.StandardButton.Cancel)
+                box.setText("Repository và code đã commit sẽ có thể được xem công khai.")
+                confirm = box.addButton("Xác nhận repository công khai", QMessageBox.ButtonRole.AcceptRole)
+                box.addButton(QMessageBox.StandardButton.Cancel).setText("Hủy")
                 box.setDefaultButton(QMessageBox.StandardButton.Cancel)
                 box.exec()
                 return box.clickedButton() is confirm
@@ -442,9 +470,9 @@ class ProjectHub(QMainWindow):
             def bound(result, error):
                 if error and getattr(error, "code", "") == "PUBLIC_CONFIRMATION_REQUIRED" and confirm_public():
                     values["public_confirmed"] = True
-                    self.start_job("Binding confirmed public repository", self.call_service("bind_github", project.project_id, **values))
-            self.start_job("Verifying GitHub repository", self.call_service("bind_github", project.project_id, **values), bound)
-        self.start_job("Detecting configured GitHub remotes", self.call_service("detect_remotes", project.project_id), detected)
+                    self.start_job("Đang liên kết repository công khai đã xác nhận", self.call_service("bind_github", project.project_id, **values))
+            self.start_job("Đang kiểm tra repository GitHub", self.call_service("bind_github", project.project_id, **values), bound)
+        self.start_job("Đang tìm remote GitHub đã cấu hình", self.call_service("detect_remotes", project.project_id), detected)
 
     def configure_reviewer(self):
         project = self.selected()
@@ -455,35 +483,35 @@ class ProjectHub(QMainWindow):
             def closed(result, error):
                 dialog.auth.setEnabled(True)
                 dialog.buttons.setEnabled(True)
-            self.start_job("Sign in manually, verify the exact tab, then use Chrome menu → Exit",
+            self.start_job("Đăng nhập thủ công, kiểm tra đúng tab rồi chọn menu Chrome → Exit",
                 self.call_service("open_reviewer_auth", project.project_id, dialog.url.text().strip(),
                     browser_profile=dialog.profile.text().strip()), closed)
         dialog.auth.clicked.connect(auth)
         if dialog.exec() == QDialog.DialogCode.Accepted:
-            self.start_job("Checking reviewer without sending", self.call_service("connect_reviewer", project.project_id,
+            self.start_job("Đang kiểm tra Reviewer, không gửi tin nhắn", self.call_service("connect_reviewer", project.project_id,
                 dialog.url.text().strip(), browser_profile=dialog.profile.text().strip()))
 
     def configure_codex(self):
         project = self.selected()
         dialog = RuntimeDialog(project, self)
         if dialog.exec() == QDialog.DialogCode.Accepted:
-            self.start_job("Checking configured Codex runtime", self.call_service("connect_codex", project.project_id, **dialog.values()))
+            self.start_job("Đang kiểm tra Codex đã cấu hình", self.call_service("connect_codex", project.project_id, **dialog.values()))
 
     def rename_project(self):
         project_id, name = self.project_id, self.name.text()
         def work():
             with ProjectRegistry(self.root) as registry:
                 return registry.rename(project_id, name)
-        self.start_job("Renaming Project", work)
+        self.start_job("Đang đổi tên dự án", work)
 
     def unregister_project(self):
         project_id = self.project_id
-        if QMessageBox.question(self, "Unregister Project", "Remove this ReviewRelay registration only? Local files, .git history, GitHub repository and task history will remain.") != QMessageBox.StandardButton.Yes:
+        if confirm_question(self, "Gỡ dự án khỏi ReviewRelay", "Chỉ gỡ đăng ký dự án khỏi ReviewRelay? File local, lịch sử .git, repository GitHub và lịch sử công việc vẫn được giữ lại.") != QMessageBox.StandardButton.Yes:
             return
         def work():
             with ProjectRegistry(self.root) as registry:
                 return registry.unregister(project_id, confirmed=True)
-        self.start_job("Unregistering Project", work)
+        self.start_job("Đang gỡ dự án", work)
 
     def open_tasks(self):
         from .task_ui import TaskWindow
@@ -502,7 +530,7 @@ class ProjectHub(QMainWindow):
 
     def closeEvent(self, event):
         if self.busy or any(window.busy for window in self.task_windows):
-            self.message.setText("Wait for the current setup operation to finish before closing.")
+            self.message.setText("Chờ thao tác thiết lập hiện tại hoàn tất trước khi đóng.")
             event.ignore()
         else:
             event.accept()
@@ -513,7 +541,7 @@ def main():
     parser.add_argument("--data-root", help="Explicit portable ReviewRelay data folder (otherwise choose it in the UI)")
     args = parser.parse_args()
     app = QApplication.instance() or QApplication([])
-    folder = args.data_root or QFileDialog.getExistingDirectory(None, "Select portable ReviewRelay data folder")
+    folder = args.data_root or QFileDialog.getExistingDirectory(None, "Chọn thư mục dữ liệu ReviewRelay")
     if not folder:
         return 0
     window = ProjectHub(PortableDataRoot(folder))

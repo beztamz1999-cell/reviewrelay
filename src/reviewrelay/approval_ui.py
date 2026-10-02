@@ -12,24 +12,24 @@ class CommandApprovalDialog(QDialog):
     def __init__(self, request, parent=None):
         super().__init__(parent)
         self.decision = "cancel"
-        self.setWindowTitle("Approve this command?")
+        self.setWindowTitle("Cho phép chạy lệnh này?")
         self.resize(720, 400)
         layout = QVBoxLayout(self)
         self.metadata = QLabel("\n".join(f"{label}: {request[key]}" for label, key in (
-            ("Project", "project_id"), ("Task", "task_id"), ("Codex thread", "thread_id"),
-            ("Turn", "turn_id"), ("cwd", "cwd"))))
+            ("Dự án", "project_id"), ("Công việc", "task_id"), ("Codex thread", "thread_id"),
+            ("Lượt", "turn_id"), ("cwd", "cwd"))))
         self.metadata.setTextFormat(Qt.TextFormat.PlainText)
         self.metadata.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         self.metadata.setWordWrap(True)
         layout.addWidget(self.metadata)
-        layout.addWidget(QLabel("Command (approval applies once):"))
+        layout.addWidget(QLabel("Lệnh cần chạy (chỉ áp dụng một lần):"))
         self.command = QTextEdit()
         self.command.setReadOnly(True)
         self.command.setPlainText(request["command"])
         layout.addWidget(self.command)
         buttons = QHBoxLayout()
         self.accept_once, self.decline, self.cancel = (QPushButton(label) for label in
-            ("Accept once", "Decline", "Cancel"))
+            ("Cho phép một lần", "Từ chối", "Hủy"))
         for button, decision in ((self.accept_once, "accept"), (self.decline, "decline"), (self.cancel, "cancel")):
             button.setAutoDefault(False)
             button.clicked.connect(lambda checked=False, value=decision: self.choose(value))

@@ -48,21 +48,21 @@ def hub(app, tmp_path):
 
 def test_project_hub_connect_controls_follow_typed_repository_readiness(hub, app):
     window, root, project = hub
-    assert window.create_button.text() == "+ Create Project"
+    assert window.create_button.text() == "+ Thêm dự án"
     assert not window.reviewer_button.isEnabled() and not window.codex_button.isEnabled()
-    assert "SETUP_REQUIRED" in window.heading.text()
+    assert "Chưa thiết lập" in window.heading.text()
     with ProjectRegistry(root) as registry:
         verified = registry.save(replace(project, local_status=Status.READY, github_status=Status.READY,
             github_repo_url="https://github.com/owner/project", github_last_verified_at="fixture-check"))
     window.refresh_projects()
     assert window.reviewer_button.isEnabled() and window.codex_button.isEnabled()
     assert "https://github.com/owner/project" in window.github_label.text()
-    assert "PROJECT_READY" not in window.heading.text()
+    assert "Sẵn sàng" not in window.heading.text()
     with ProjectRegistry(root) as registry:
         registry.save(replace(verified, chatgpt_status=Status.READY, codex_status=Status.READY,
             chatgpt_conversation_url="https://chatgpt.com/c/ui-fixture", worker_settings={"executable": "fixture.exe"}))
     window.refresh_projects()
-    assert "PROJECT_READY" in window.heading.text()
+    assert "Sẵn sàng" in window.heading.text()
 
 
 def test_create_dialog_requires_explicit_new_existing_and_new_github_choice(app):
@@ -85,8 +85,8 @@ def test_detected_github_is_explicit_option_create_and_link_visibility(hub, app)
     _, _, project = hub
     remote = DetectedRemote("upstream", "git@github.com:owner/project.git", "https://github.com/owner/project")
     dialog = GitHubSetupDialog(project, (remote,))
-    assert "Detected" in dialog.detected.currentText()
-    assert dialog.buttons.button(QDialogButtonBox.StandardButton.Ok).text() == "Use This Repository"
+    assert "Đã phát hiện" in dialog.detected.currentText()
+    assert dialog.buttons.button(QDialogButtonBox.StandardButton.Ok).text() == "Dùng repository này"
     assert dialog.values()["remote_name"] == "upstream" and dialog.values()["action"] == "link"
     dialog.detected.setCurrentIndex(0)
     dialog.action.setCurrentIndex(1)
@@ -94,7 +94,7 @@ def test_detected_github_is_explicit_option_create_and_link_visibility(hub, app)
     assert not dialog.buttons.button(QDialogButtonBox.StandardButton.Ok).isEnabled()
     dialog.visibility.setCurrentText("PUBLIC")
     assert dialog.buttons.button(QDialogButtonBox.StandardButton.Ok).isEnabled()
-    assert "not comprehensive secret scanning" in " ".join(label.text() for label in dialog.findChildren(QLabel))
+    assert "không thay thế việc rà soát toàn bộ dữ liệu bí mật" in " ".join(label.text() for label in dialog.findChildren(QLabel))
     assert "public_confirmed" not in dialog.values()  # The separate explicit confirmation has not happened.
     dialog.close()
 
@@ -143,11 +143,11 @@ def test_unregister_warning_keeps_source_and_history(hub, app, monkeypatch):
     def decline(parent, title, text):
         warnings.append(text)
         return QMessageBox.StandardButton.No
-    monkeypatch.setattr(QMessageBox, "question", decline)
+    monkeypatch.setattr("reviewrelay.ui.confirm_question", decline)
     window.unregister_project()
     assert not window.busy
-    assert "registration only" in warnings[0] and "GitHub repository" in warnings[0]
-    monkeypatch.setattr(QMessageBox, "question", lambda *args: QMessageBox.StandardButton.Yes)
+    assert "Chỉ gỡ đăng ký" in warnings[0] and "repository GitHub" in warnings[0]
+    monkeypatch.setattr("reviewrelay.ui.confirm_question", lambda *args: QMessageBox.StandardButton.Yes)
     window.unregister_project()
     spin(app, lambda: not window.busy)
     with ProjectRegistry(root) as registry:
@@ -162,6 +162,6 @@ def test_runtime_and_reviewer_dialogs_do_not_define_task_thread_fields(hub, app)
     assert "thread" not in runtime.values()
     reviewer = ReviewerDialog(project)
     assert reviewer.profile.text() == "reviewer-chrome"
-    assert reviewer.auth.text() == "Open Manual Auth Mode"
+    assert reviewer.auth.text() == "Mở Chrome để đăng nhập"
     runtime.close()
     reviewer.close()

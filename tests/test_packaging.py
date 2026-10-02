@@ -11,6 +11,9 @@ import pytest
 from reviewrelay.storage import PortableDataRoot
 from test_controller import h, run
 from test_project_ui import app
+from reviewrelay.projects import ProjectRegistry
+from dataclasses import replace
+import asyncio
 
 
 PACKAGING = Path(__file__).resolve().parents[1] / "packaging"
@@ -101,6 +104,58 @@ def test_transport_probe_cannot_dispatch_turn_or_send_review():
     rpc = [node.args[0].value for node in ast.walk(probe) if isinstance(node, ast.Call)
         and isinstance(node.func, ast.Attribute) and node.func.attr == "request"]
     assert rpc == ["initialize"]
+
+
+def test_chatgpt_probe_evaluates_only_read_only_webdriver_and_cannot_send_or_navigate():
+    tree = ast.parse((PACKAGING / "reviewrelay_frozen_smoke.py").read_text())
+    probe = next(n for n in tree.body if isinstance(n, ast.AsyncFunctionDef) and n.name == "chatgpt_cdp_probe")
+    calls = [n for n in ast.walk(probe) if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)]
+    assert not {n.func.attr for n in calls} & {"goto", "reload", "add_cookies", "send_review_pack",
+        "send_evidence", "send_instruction", "start_task", "add_init_script", "request"}
+    evaluations = [n.args[0].value for n in calls if n.func.attr == "evaluate"]
+    assert evaluations == ["navigator.webdriver"]
+
+
+@pytest.mark.parametrize("webdriver", [False, True])
+def test_disposable_chatgpt_probe_records_only_boolean_and_never_dispatches(tmp_path, monkeypatch, webdriver):
+    from types import SimpleNamespace
+    root = PortableDataRoot(tmp_path/'data').create()
+    (root.path / smoke.COPY_MARKER).write_text("disposable")
+    url = "https://chatgpt.com/c/packaged-read-only"
+    with ProjectRegistry(root) as registry:
+        project = registry.create("Probe", str(tmp_path/'repo'), "EXISTING")
+        registry.save(replace(project, chatgpt_conversation_url=url,
+            reviewer_settings={"browser_backend":"google-chrome-cdp", "browser_profile":"dedicated"}))
+    expressions, opened, closed = [], [], []
+    class Page:
+        def __init__(self): self.url=url
+        def is_closed(self): return False
+        async def evaluate(self, expression):
+            expressions.append(expression)
+            return webdriver
+        async def title(self): return "ChatGPT"
+        def locator(self, selector):
+            async def count(): return 0
+            return SimpleNamespace(count=count)
+    class Reviewer:
+        def __init__(self,*args):
+            self.page=Page(); self._cdp_port=54321; self._chrome_process=object()
+            self._context=SimpleNamespace(pages=[self.page]); self.browser_version="Chrome-fixture"
+        async def start(self): pass
+        async def close(self): closed.append(True)
+        def _same_conversation(self, actual,target): return actual==target
+        async def open_task_conversation(self,target): opened.append(target)
+        async def _find_composer(self): return object()
+    monkeypatch.setattr(smoke,"ChatGPTWebAdapter",Reviewer)
+    monkeypatch.setattr(smoke,"chrome_listener_ready",lambda *args:True)
+    result = asyncio.run(smoke.chatgpt_cdp_probe(dict(data_root=str(root.path),project_id=project.project_id,
+        browser_data_root=str(tmp_path/'same-dedicated-browser-root'), acceptance_seconds=10)))
+    assert result["navigator_webdriver"] is webdriver
+    assert result["status"] == ("PASS" if webdriver is False else "FAIL")
+    assert result["nonzero_cdp_port"] and result["localhost_only"] and result["restored_tab"]
+    assert result["cloudflare_loop"] == "NO"
+    assert expressions==["navigator.webdriver"] and opened==[url] and closed==[True]
+    assert result["codex_inference_turns"] == result["chatgpt_messages_sent"] == 0
 
 
 @pytest.mark.parametrize("chooser", [False, True])

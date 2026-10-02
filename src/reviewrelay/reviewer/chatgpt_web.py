@@ -39,7 +39,9 @@ from .chrome_cdp import (
     ReviewRelayProfileLock,
     find_google_chrome,
     launch_chrome,
-    read_chrome_cdp_endpoint,
+    chrome_cdp_endpoint,
+    chrome_listener_ready,
+    select_loopback_port,
     request_chrome_shutdown,
 )
 from .errors import (
@@ -119,6 +121,7 @@ class ChatGPTWebAdapter:
         self._page: Any = None
         self._chrome_process: subprocess.Popen[bytes] | None = None
         self._cdp_endpoint: str | None = None
+        self._cdp_port: int | None = None
         self._start_lock = asyncio.Lock()
         self._navigation_generation = 0
         self._tracked_pages: set[int] = set()
@@ -248,6 +251,7 @@ class ChatGPTWebAdapter:
             await self._stop_chrome_process(process)
             if process.poll() is not None:
                 self._chrome_process = None
+                self._cdp_port = None
         profile_lock = self._profile_lock
         if profile_lock is not None and self._owns_profile_lock:
             if process is None or process.poll() is not None:
@@ -293,45 +297,70 @@ class ChatGPTWebAdapter:
         if self.profile_path is None or self._playwright is None:
             raise BrowserStartFailed("ReviewRelay Chrome profile is not ready")
 
-        if self._chrome_process is None or self._chrome_process.poll() is not None:
-            self._chrome_process = None
-            self._cdp_endpoint = None
-            active_port = self.profile_path / "DevToolsActivePort"
-            self.data_root.assert_managed_path(active_port)
-            active_port.unlink(missing_ok=True)
-            try:
-                self._chrome_process = launch_chrome(
-                    find_google_chrome(),
-                    self.profile_path,
-                    mode=ChromeMode.AUTOMATION,
-                )
-            except Exception as exc:
-                raise BrowserStartFailed(f"Could not launch the installed Google Chrome browser: {type(exc).__name__}") from exc
-
-        deadline = asyncio.get_running_loop().time() + self.settings.timeouts.navigation_seconds
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + self.settings.timeouts.navigation_seconds
+        reconnect = self._chrome_process is not None and self._chrome_process.poll() is None
+        attempts = 1 if reconnect else 3
         last_error: Exception | None = None
-        while asyncio.get_running_loop().time() < deadline:
-            if self._chrome_process is None or self._chrome_process.poll() is not None:
-                raise BrowserStartFailed("ReviewRelay Google Chrome exited before its localhost CDP endpoint was ready")
-            endpoint = read_chrome_cdp_endpoint(self.profile_path)
-            if endpoint is not None:
-                remaining_ms = max(1, int((deadline - asyncio.get_running_loop().time()) * 1000))
+        used_ports: set[int] = set()
+        for attempt in range(attempts):
+            if loop.time() >= deadline:
+                break
+            if not reconnect:
+                self._chrome_process = None
+                self._cdp_endpoint = None
+                self._cdp_port = None
                 try:
-                    browser = await self._playwright.chromium.connect_over_cdp(
-                        endpoint,
-                        timeout=min(1000, remaining_ms),
+                    # Avoid selecting the same raced/unusable port on a retry.
+                    for _ in range(8):
+                        port = select_loopback_port()
+                        if port not in used_ports:
+                            break
+                    else:
+                        raise OSError("Could not select a fresh Chrome CDP port")
+                    used_ports.add(port)
+                    self._cdp_port = port
+                    self._chrome_process = launch_chrome(
+                        find_google_chrome(), self.profile_path, mode=ChromeMode.AUTOMATION,
+                        debugging_port=port,
                     )
-                    if not browser.contexts:
-                        await browser.close()
-                        raise BrowserStartFailed("ReviewRelay Google Chrome exposed no default browser context")
-                    self._browser = browser
-                    self._cdp_endpoint = endpoint
-                    return
-                except BrowserStartFailed:
-                    raise
                 except Exception as exc:
                     last_error = exc
-            await asyncio.sleep(0.1)
+                    continue
+            if self._cdp_port is None:
+                raise BrowserStartFailed("ReviewRelay Chrome has no known selected CDP port")
+            endpoint = chrome_cdp_endpoint(self._cdp_port)
+            attempt_deadline = loop.time() + (deadline - loop.time()) / (attempts - attempt)
+            while loop.time() < attempt_deadline:
+                if self._chrome_process is None or self._chrome_process.poll() is not None:
+                    last_error = BrowserStartFailed("ReviewRelay Chrome exited before CDP was ready")
+                    break
+                try:
+                    ready = chrome_listener_ready(self._chrome_process, self._cdp_port)
+                except OSError as exc:
+                    last_error = exc
+                    break  # A foreign/non-loopback listener is never contacted or closed.
+                if ready:
+                    remaining_ms = max(1, int((attempt_deadline - loop.time()) * 1000))
+                    try:
+                        browser = await self._playwright.chromium.connect_over_cdp(
+                            endpoint, timeout=min(1000, remaining_ms),
+                        )
+                        if not browser.contexts:
+                            await browser.close()
+                            raise BrowserStartFailed("ReviewRelay Google Chrome exposed no default browser context")
+                        self._browser = browser
+                        self._cdp_endpoint = endpoint
+                        return
+                    except BrowserStartFailed:
+                        raise
+                    except Exception as exc:
+                        last_error = exc
+                await asyncio.sleep(min(0.1, max(0, attempt_deadline - loop.time())))
+            if not reconnect and self._chrome_process is not None:
+                await self._stop_chrome_process(self._chrome_process)
+                if self._chrome_process.poll() is None:
+                    raise BrowserStartFailed("Chrome did not exit; refusing concurrent profile reuse") from last_error
         raise BrowserStartFailed("ReviewRelay Google Chrome did not expose a usable localhost CDP endpoint") from last_error
 
     @staticmethod

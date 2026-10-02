@@ -183,7 +183,7 @@ class TaskWindow(QMainWindow):
             self.summary.setText(f"Task: {task.task_id} — {task.title}\nState: {task.state.value}\nSpec: {task_spec_path(task.task_id)}\n"
                 f"Branch: {task_branch_name(task.task_id)}\nBase SHA: {task.base_sha or 'Not committed'}\nCandidate SHA: {task.candidate_sha or 'None'}\n"
                 f"Remote SHA: {publication['github_last_remote_sha'] if publication else 'None'}\n"
-                f"Codex: {record.worker_last_turn_status or 'Not started'} | thread: {record.worker_thread_id or 'None'} | turns: {counters['worker_initial_turns'] + counters['worker_fix_turns'] + counters.get('worker_manual_turns', 0)}\n"
+                f"Codex: {record.worker_last_turn_status or 'Not started'} | thread: {record.worker_thread_id or 'None'} | turns: {counters['worker_initial_turns'] + counters['worker_fix_turns'] + counters.get('worker_continuation_turns', 0) + counters.get('worker_manual_turns', 0)}\n"
                 f"GitHub: {publication['github_publish_status'] if publication else 'Not published'} | PR: {publication['github_pr_url'] if publication else 'None'}\n"
                 f"ChatGPT: {task.state.value} | review messages: {counters['review_messages']} | evidence messages: {counters['evidence_messages']}\n"
                 f"Review cycle: {task.review_cycle} | Fix cycles: {task.fix_cycles} | Evidence cycles: {task.evidence_cycles} | Local batches: {counters['local_evidence_batches']}\n"

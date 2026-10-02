@@ -173,7 +173,10 @@
       const text = composer.innerText;
       const modernLive = mode === "modern-live-opaque-upload";
       const user = document.createElement(modernLive ? "div" : "article");
-      if (modernLive) user.classList.add("bg-user-message");
+      if (modernLive) {
+        user.classList.add("bg-user-message");
+        user.setAttribute("data-chatgpt-search-message-ids", `relay-user-${nextId++}`);
+      }
       else {
         user.dataset.messageAuthorRole = "user";
         user.dataset.messageId = `relay-user-${nextId++}`;
@@ -200,6 +203,7 @@
       let assistantContent = assistant;
       if (modernLive) {
         assistant.classList.add("group", "min-w-0", "flex-col");
+        assistant.setAttribute("data-chatgpt-selection-message-id", `relay-assistant-${nextId++}`);
         const markdown = document.createElement("div");
         markdown.className = "MarkdownRoot-fixture";
         assistant.append(markdown);

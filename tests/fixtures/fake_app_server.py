@@ -104,6 +104,12 @@ for line in sys.stdin:
         if mode == "interactive":
             send({"id": "request-approval", "method": "item/commandExecution/requestApproval", "params": p})
             continue
+        if mode.startswith("approval"):
+            send({"id": "request-approval", "method": "item/commandExecution/requestApproval", "params": p | {
+                "threadId": "unrelated" if mode == "approval-foreign" else current_thread["id"],
+                "environmentId": "remote-host" if mode == "approval-remote" else "local",
+                "itemId": "approved-command", "command": "git status --short", "cwd": current_thread["cwd"]}})
+            continue
         if mode == "auth":
             send({"id": "request-auth", "method": "account/chatgptAuthTokens/refresh", "params": {}})
             continue
@@ -128,5 +134,9 @@ for line in sys.stdin:
     elif method == "turn/interrupt":
         result(request, {})
         complete("interrupted")
+    elif method == "thread/read":
+        result(request, {"thread": json.loads(state_path.read_text(encoding="utf-8"))})
+    elif request.get("id") == "request-approval" and "result" in request:
+        complete("completed" if request["result"]["decision"] == "accept" else "interrupted")
 if mode == "hang-close":
     time.sleep(60)

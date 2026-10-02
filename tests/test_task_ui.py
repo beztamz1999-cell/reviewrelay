@@ -124,6 +124,15 @@ def test_ui_background_job_remains_responsive_and_cannot_dispatch_twice(window, 
         spin(app, lambda: not window.busy)
 
 
+def test_ui_continuation_turn_count_uses_all_durable_worker_counters(window, h, app):
+    c, task = h.create()
+    c.store.save(replace(task, counters={**task.counters, "worker_initial_turns": 1,
+        "worker_fix_turns": 2, "worker_continuation_turns": 4, "worker_manual_turns": 1}), "fixture")
+    c.close()
+    window.refresh()
+    assert "| turns: 8\n" in window.summary.text()
+
+
 def test_owner_question_visible_and_explicit_input_only_routes_to_reviewer(window, h, app, monkeypatch):
     h.actions = ["OWNER_DECISION_REQUIRED", "PASS"]
     c, task = h.create()

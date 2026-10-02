@@ -15,6 +15,7 @@ class ChatGPTSelectors:
     """Small selector catalog; accessible names precede stable DOM fallbacks."""
 
     user_turns: str = "[data-message-author-role='user'], main [class~='bg-user-message']"
+    user_message_content: str = "[data-markdown-text-tone='user-message']"
     assistant_turns: str = (
         "[data-message-author-role='assistant'], "
         "main [class~='group'][class~='min-w-0'][class~='flex-col']:has([class*='MarkdownRoot-'])"

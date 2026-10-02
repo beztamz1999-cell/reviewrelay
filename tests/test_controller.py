@@ -20,6 +20,7 @@ from reviewrelay.github_publish import GitHubCandidatePublisher, task_branch_nam
 from reviewrelay.models import utc_now_iso
 from reviewrelay.projects import ConnectionStatus as Status, ProjectRegistry
 from reviewrelay.reviewer.base import AssistantResponse, SendResult, TurnBaseline
+from reviewrelay.reviewer.errors import MessageSendFailed, MessageSendAmbiguous, ReviewerConversationChanged
 from reviewrelay.state import StateStore
 from reviewrelay.storage import PortableDataRoot
 from reviewrelay.worker.base import TurnStatus, WorkerEvent, WorkerTurnResult
@@ -43,6 +44,8 @@ class Harness:
         self.root, self.repo, self.remote, self.project = root, repo, remote, project
         self.actions = ["PASS"]
         self.initial = self.fixes = self.sends = self.batches = 0
+        self.continuations = 0
+        self.inspected_status = "INTERRUPTED"
         self.manuals = []
         self.manual_no_commit = False
         self.manual_fault = None
@@ -81,6 +84,8 @@ class Harness:
                 self.manual = prompt.startswith("ReviewRelay Owner manual instruction")
                 if self.manual:
                     harness.manuals.append((self.task.task_id, prompt))
+                elif "after a proven completed turn" in prompt:
+                    harness.continuations += 1
                 else:
                     harness.fixes += 1
                     assert "reviewer instruction" in prompt and "validated fix" in prompt
@@ -89,7 +94,7 @@ class Harness:
                 return await self.start(prompt)
 
             async def start(self, prompt):
-                self.turn = f"turn-{harness.initial}-{harness.fixes}-{len(harness.manuals)}"
+                self.turn = f"turn-{harness.initial}-{harness.fixes}-{len(harness.manuals)}-{harness.continuations}"
                 with StateStore(harness.root) as state:
                     r = state.get(self.task.project_id, self.task.task_id)
                     state.save(replace(r, worker_thread_id=self.thread, worker_session_identity=self.thread,
@@ -132,6 +137,12 @@ class Harness:
                     self.thread = state.get(self.task.project_id, self.task.task_id).worker_thread_id
                 return self.thread
 
+            async def inspect_last_turn(self):
+                with StateStore(harness.root) as state:
+                    record = state.get(self.task.project_id, self.task.task_id)
+                    state.save(replace(record, worker_last_turn_status=harness.inspected_status))
+                return harness.inspected_status
+
             async def interrupt(self):
                 if harness.worker_gate:
                     harness.worker_gate.set()
@@ -140,6 +151,18 @@ class Harness:
                 pass
 
         class Reviewer:
+            async def reconcile_visible_review(self, *, prompt, review_key, conversation_url, dispatched_at):
+                if harness.review_fault == "wrong_pair":
+                    raise ReviewerConversationChanged("Visible pairing differs")
+                return SendResult(review_key, conversation_url, dispatched_at, "review", (),
+                    hashlib.sha256(prompt.encode()).hexdigest(), TurnBaseline((), ("old-assistant",), 0), "user-reconciled")
+
+            async def discard_unsent_prompt(self, *, prompt, conversation_url):
+                if harness.review_fault == "owner_draft":
+                    raise ReviewerConversationChanged("Owner draft must remain intact")
+                return {"conversation_url": conversation_url, "prompt_sha256": hashlib.sha256(prompt.encode()).hexdigest(),
+                    "baseline": {"user_turn_ids": [], "assistant_turn_ids": [], "navigation_generation": 0}, "draft_cleared": True}
+
             async def send_review_pack(self, **kwargs):
                 return await self.send(**kwargs)
 
@@ -154,6 +177,12 @@ class Harness:
                 assert kwargs["attachment_paths"] == ()
                 harness.sends += 1
                 harness.notifications.append(kwargs)
+                if harness.review_fault == "preclick":
+                    raise MessageSendFailed("Composer content did not match before send")
+                if harness.review_fault == "ui_ambiguous":
+                    pending = SendResult(kwargs["review_key"], kwargs["conversation_url"], utc_now_iso(), "review", (),
+                        hashlib.sha256(kwargs["prompt"].encode()).hexdigest(), TurnBaseline((), ("old-assistant",), 0), "pending")
+                    raise MessageSendAmbiguous("Unknown click confirmation", send_result=pending)
                 if harness.review_fault == "ambiguous" or harness.sends == harness.fail_send_number:
                     raise ControllerError("Unknown send result", code="SEND_AMBIGUOUS")
                 return SendResult(kwargs["review_key"], kwargs["conversation_url"], utc_now_iso(), "review", (),
@@ -295,6 +324,180 @@ def test_owner_pause_and_explicit_owner_input_go_to_reviewer_not_worker(h):
     assert result.state is S.COMPLETE and h.fixes == 0 and h.sends == 2
     assert "REVIEWRELAY_OWNER_DECISION" in h.notifications[-1]["prompt"]
     assert result.owner_inputs[-1]["text"] == "Keep the requested harmless scope"
+    c.close()
+
+
+@pytest.mark.parametrize("legacy", [False, True])
+def test_explicit_preclick_reconciliation_reuses_review_key_candidate_and_worker(h, legacy):
+    c, task = h.create()
+    h.review_fault = "preclick"
+    blocked = run(c.run(task.task_id))
+    key = blocked.pending["key"]
+    effect = c.store.effect(key)
+    assert effect["status"] == "NOT_SENT"
+    if legacy:
+        c.store.put_effect(blocked, key, "REVIEW_SEND", "AMBIGUOUS", effect["payload"])
+    identity = c.open_worker(task.task_id).identity
+    h.review_fault = None
+    pushes = h.publisher_events.count("GITHUB_PUSH_IN_FLIGHT")
+    run(c.reconcile_unsent_review(identity))
+    result = run(c.run(task.task_id))
+    assert result.state is S.COMPLETE and result.ready_for_owner_review
+    assert result.candidate_sha == blocked.candidate_sha and result.worker_thread_id == identity.worker_thread_id
+    assert h.initial == 1 and h.fixes == h.continuations == 0
+    assert h.notifications[0]["review_key"] == h.notifications[1]["review_key"] == key
+    assert h.publisher_events.count("GITHUB_PUSH_IN_FLIGHT") == pushes
+    assert run(c.run(task.task_id, resume=True)).state is S.COMPLETE and h.sends == 2
+    c.close()
+
+
+@pytest.mark.parametrize("mutation", ["unknown_click", "send_result", "candidate", "owner_draft", "thread"])
+def test_preclick_reconciliation_cannot_authorize_unknown_or_different_effect(h, mutation):
+    c, task = h.create()
+    h.review_fault = "preclick"
+    blocked = run(c.run(task.task_id))
+    identity = c.open_worker(task.task_id).identity
+    key = blocked.pending["key"]
+    effect = c.store.effect(key)
+    if mutation == "unknown_click":
+        c.store.save(replace(blocked, error_code="MESSAGE_SEND_AMBIGUOUS"), "fixture")
+    elif mutation in {"send_result", "candidate"}:
+        payload = {**effect["payload"], "send_result": {"user_turn_identity": "sent"}} if mutation == "send_result" else {**effect["payload"], "candidate_sha": "f" * 40}
+        c.store.put_effect(blocked, key, "REVIEW_SEND", "AMBIGUOUS", payload)
+    elif mutation == "owner_draft":
+        h.review_fault = "owner_draft"
+    elif mutation == "thread":
+        identity = replace(identity, worker_thread_id="wrong-thread")
+    with pytest.raises((ControllerError, ReviewerConversationChanged)):
+        run(c.reconcile_unsent_review(identity))
+    assert h.sends == 1 and h.initial == 1
+    assert c.store.get(h.project.project_id, task.task_id).state is S.PAUSED_ERROR
+    c.close()
+
+
+@pytest.mark.parametrize("mutation", [None, "no_proof", "extra_dispatch", "wrong_pair"])
+def test_visible_review_reconciliation_requires_durable_absence_and_one_dispatch(h, mutation):
+    c, task = h.create()
+    h.review_fault = "preclick"
+    run(c.run(task.task_id))
+    identity = c.open_worker(task.task_id).identity
+    h.review_fault = None
+    run(c.reconcile_unsent_review(identity))
+    h.review_fault = "ui_ambiguous"
+    blocked = run(c.run(task.task_id))
+    key = blocked.pending['key']
+    assert c.store.effect(key)['payload']['send_result']['user_turn_identity'] == 'pending'
+    assert blocked.error_code == 'MESSAGE_SEND_AMBIGUOUS'
+    if mutation == 'no_proof':
+        with c.store.db:
+            c.store.db.execute("DELETE FROM controller_events WHERE kind='REVIEW_PRE_CLICK_FAILURE_RECONCILED'")
+    elif mutation == 'extra_dispatch':
+        c.store.dispatch(blocked, key, 'REVIEW_SEND', 'review_messages')
+    h.review_fault = 'wrong_pair' if mutation == 'wrong_pair' else None
+    if mutation:
+        with pytest.raises((ControllerError, ReviewerConversationChanged)):
+            run(c.reconcile_visible_review(identity))
+        assert c.store.review(key) is None
+    else:
+        run(c.reconcile_visible_review(identity))
+        result = run(c.run(task.task_id))
+        assert result.state is S.COMPLETE and result.ready_for_owner_review
+        assert result.worker_thread_id == identity.worker_thread_id and result.candidate_sha == blocked.candidate_sha
+        assert c.store.effect(key)['payload']['reconciled'] is True
+        assert run(c.run(task.task_id, resume=True)).state is S.COMPLETE
+    assert (h.initial,h.fixes,h.sends)==(1,0,2)
+    c.close()
+
+
+@pytest.mark.parametrize("fault", ["dirty", "no_commit"])
+def test_explicit_completed_worker_continuation_keeps_thread_and_initial_once(h, fault):
+    (h.repo / "result.txt").write_text("initial\n")
+    git(h.repo, "add", "--", "result.txt")
+    git(h.repo, "commit", "-m", "fixture tracked implementation file")
+    c, task = h.create()
+    h.worker_fault = fault
+    blocked = run(c.run(task.task_id))
+    assert blocked.state is S.PAUSED_ERROR
+    identity = c.open_worker(task.task_id).identity
+    assert blocked.worker_thread_id == identity.worker_thread_id
+    h.worker_fault = None
+    planned = run(c.continue_incomplete_worker(identity, "Complete tests and commit the existing task work."))
+    assert planned.state is S.WORKER_RUNNING
+    result = run(c.run(task.task_id))
+    assert result.state is S.COMPLETE and result.ready_for_owner_review
+    assert result.worker_thread_id == identity.worker_thread_id
+    assert (h.initial, h.continuations, h.fixes, h.sends) == (1, 1, 0, 1)
+    assert result.counters["worker_continuation_turns"] == 1
+    assert run(c.run(task.task_id, resume=True)).state is S.COMPLETE
+    assert (h.initial, h.continuations, h.sends) == (1, 1, 1)
+    with pytest.raises(ControllerError):
+        run(c.continue_incomplete_worker(identity, "Never replay"))
+    c.close()
+
+
+@pytest.mark.parametrize("mutation", ["ambiguous", "thread", "spec", "untracked", "diff"])
+def test_worker_continuation_fails_closed_on_unreconciled_state(h, mutation):
+    (h.repo / "result.txt").write_text("initial\n")
+    git(h.repo, "add", "--", "result.txt")
+    git(h.repo, "commit", "-m", "fixture tracked implementation file")
+    c, task = h.create()
+    h.worker_fault = "dirty"
+    blocked = run(c.run(task.task_id))
+    identity = c.open_worker(task.task_id).identity
+    if mutation == "ambiguous":
+        key = c._key(blocked, "WORKER_INITIAL", 0)
+        effect = c.store.effect(key)
+        c.store.put_effect(blocked, key, "WORKER_INITIAL", "AMBIGUOUS", effect["payload"])
+    elif mutation == "thread":
+        identity = replace(identity, worker_thread_id="another-thread")
+    elif mutation == "spec":
+        (h.repo / task_spec_path(task.task_id)).write_text("changed")
+    elif mutation == "untracked":
+        (h.repo / "unrelated.txt").write_text("Owner work")
+    if mutation == "diff":
+        run(c.continue_incomplete_worker(identity, "Finish existing task"))
+        (h.repo / "result.txt").write_text("changed after planning")
+        assert run(c.run(task.task_id)).state is S.PAUSED_ERROR
+    else:
+        with pytest.raises(ControllerError):
+            run(c.continue_incomplete_worker(identity, "Finish existing task"))
+    assert (h.initial, h.continuations, h.sends) == (1, 0, 0)
+    c.close()
+
+
+@pytest.mark.parametrize("terminal", ["INTERRUPTED", "FAILED", "COMPLETED"])
+def test_continuation_reconciliation_requires_authoritative_unsuccessful_terminal_turn(h, terminal):
+    (h.repo / "result.txt").write_text("initial\n")
+    git(h.repo, "add", "--", "result.txt")
+    git(h.repo, "commit", "-m", "fixture tracked implementation file")
+    c, task = h.create()
+    h.worker_fault = "dirty"
+    run(c.run(task.task_id))
+    identity = c.open_worker(task.task_id).identity
+    run(c.continue_incomplete_worker(identity, "Finish existing task"))
+    h.worker_fault = "failure"
+    blocked = run(c.run(task.task_id))
+    assert blocked.state is S.PAUSED_ERROR and blocked.resume_state == S.WORKER_RUNNING.value
+    with pytest.raises(ControllerError):
+        run(c.continue_incomplete_worker(identity, "No blind retry"))
+    h.inspected_status = terminal
+    if terminal == "COMPLETED":
+        with pytest.raises(ControllerError):
+            run(c.reconcile_interrupted_continuation(identity))
+    else:
+        reconciled = run(c.reconcile_interrupted_continuation(identity))
+        key = c._key(reconciled, "WORKER_CONTINUATION", 1)
+        assert c.store.effect(key)["payload"]["terminal_status"] == terminal
+        h.worker_fault = None
+        run(c.continue_incomplete_worker(identity, "Finish existing task"))
+        result = run(c.run(task.task_id))
+        assert result.state is S.COMPLETE
+        assert result.worker_thread_id == identity.worker_thread_id
+        assert result.counters["worker_continuation_turns"] == 2
+        assert c.request_worker_pause(identity).status.value == "PAUSED_OWNER_STEER"
+        run(c.resume_auto_relay(identity))
+        assert run(c.run(task.task_id, resume=True)).state is S.COMPLETE
+        assert h.sends == 1 and h.initial == 1 and h.continuations == 2
     c.close()
 
 

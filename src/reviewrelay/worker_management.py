@@ -122,9 +122,15 @@ class WorkerManagement:
         record = self.store.state.get(self.project_id, task.task_id)
         if record.worker_thread_id and record.worker_last_turn_status != "COMPLETED":
             return True
-        if self.store.db.execute("SELECT 1 FROM controller_effects WHERE project_id=? AND task_id=? "
-                "AND status NOT IN ('PLANNED','COMPLETED') LIMIT 1", (self.project_id, task.task_id)).fetchone():
-            return True
+        effects = self.store.db.execute("SELECT kind,status,payload_json FROM controller_effects WHERE project_id=? AND task_id=? "
+                "AND status NOT IN ('PLANNED','COMPLETED')", (self.project_id, task.task_id)).fetchall()
+        for effect in effects:
+            payload = json.loads(effect["payload_json"])
+            if (effect["status"] != "RECONCILED_TERMINAL" or effect["kind"] != "WORKER_CONTINUATION"
+                    or payload.get("proof_source") != "thread/read" or payload.get("terminal_status") not in {"INTERRUPTED", "FAILED"}
+                    or payload.get("thread_id") != record.worker_thread_id or not payload.get("turn_id")
+                    or payload["turn_id"] == record.worker_last_turn_id):
+                return True
         row = self.store.db.execute("SELECT github_publish_status FROM github_publications WHERE project_id=? AND task_id=?",
             (self.project_id, task.task_id)).fetchone()
         publication = self.store.db.execute("SELECT metadata_json FROM github_publications WHERE project_id=? AND task_id=?",

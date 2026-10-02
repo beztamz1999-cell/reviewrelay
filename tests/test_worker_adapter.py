@@ -30,6 +30,91 @@ from reviewrelay.worker.transport import decode_message
 FIXTURE = Path(__file__).parent / "fixtures" / "fake_app_server.py"
 
 
+@pytest.mark.parametrize("decision", ["accept", "decline", "cancel", "acceptForSession"])
+def test_bound_command_approval_requires_one_command_owner_decision(worker_setup, decision):
+    _, config, fake_state, make = worker_setup
+    calls = []
+    async def approve(request):
+        calls.append(request)
+        assert request["thread_id"] == "fixture-thread"
+        assert request["turn_id"] == "fixture-turn-1"
+        assert request["cwd"] == config.repo.path
+        assert request["command"] == "git status --short"
+        return decision
+    async def execute():
+        adapter = make("approval", command_approval=approve)
+        try:
+            await adapter.start_task("harmless")
+            if decision == "accept":
+                assert (await adapter.wait_until_done()).status is TurnStatus.COMPLETED
+            else:
+                with pytest.raises(WorkerInteractionRequired if decision == "acceptForSession" else WorkerTurnInterrupted):
+                    await adapter.wait_until_done()
+        finally:
+            await adapter.close()
+    asyncio.run(execute())
+    assert len(calls) == 1
+    sent = requests(fake_state)
+    assert next(r for r in sent if r.get("method") == "turn/start")["params"]["approvalPolicy"] == "on-request"
+    replies = [r for r in sent if r.get("id") == "request-approval" and "result" in r]
+    assert len(replies) == (0 if decision == "acceptForSession" else 1)
+
+
+@pytest.mark.parametrize("mode", ["approval-foreign", "approval-remote"])
+def test_foreign_command_approval_never_reaches_owner(worker_setup, mode):
+    _, _, fake_state, make = worker_setup
+    async def unexpected(request):
+        pytest.fail("Foreign Task approval reached Owner callback")
+    async def execute():
+        adapter = make(mode, command_approval=unexpected)
+        try:
+            await adapter.start_task("harmless")
+            with pytest.raises(WorkerBindingMismatch):
+                await adapter.wait_until_done()
+        finally:
+            await adapter.close()
+    asyncio.run(execute())
+    assert not any("result" in r and r.get("id") == "request-approval" for r in requests(fake_state))
+
+
+def test_read_only_terminal_turn_inspection_never_dispatches_another_turn(worker_setup):
+    root, config, fake_state, make = worker_setup
+    async def execute():
+        first = make("interrupted")
+        await first.start_task("harmless")
+        with pytest.raises(WorkerTurnInterrupted):
+            await first.wait_until_done()
+        await first.close()
+        second = make()
+        try:
+            assert await second.inspect_last_turn() == "INTERRUPTED"
+        finally:
+            await second.close()
+    asyncio.run(execute())
+    methods = [r.get("method") for r in requests(fake_state)]
+    assert methods.count("turn/start") == methods.count("thread/start") == 1
+    assert methods.count("thread/read") == 1
+    with StateStore(root) as store:
+        assert store.get(config.project_id, "task").worker_last_turn_status == "INTERRUPTED"
+
+
+def test_owner_wait_uses_overall_bound_without_inference_idle_timeout(worker_setup):
+    _, _, _, make = worker_setup
+    async def approve(request):
+        await asyncio.sleep(.3)
+        return "accept"
+    async def execute():
+        adapter = make("approval", command_approval=approve,
+            timeouts=WorkerTimeouts(startup_seconds=2, initialize_seconds=1, request_seconds=1,
+                                   idle_seconds=.1, overall_seconds=3, shutdown_seconds=.3))
+        try:
+            await adapter.start_task("harmless")
+            assert (await adapter.wait_until_done()).status is TurnStatus.COMPLETED
+        finally:
+            await adapter.close()
+    asyncio.run(execute())
+
+
 @pytest.fixture
 def worker_setup(tmp_path, git_repo):
     root = PortableDataRoot(tmp_path / "portable").create()
@@ -40,9 +125,10 @@ def worker_setup(tmp_path, git_repo):
                               idle_seconds=1, overall_seconds=3, shutdown_seconds=.3)
 
     def make(mode="normal", **overrides):
+        approval = overrides.pop("command_approval", None)
         settings = CodexWorkerSettings(timeouts=overrides.pop("timeouts", timeouts), **overrides)
         return CodexAppServerAdapter(root, config, "task", settings,
-                                     process_command=(sys.executable, str(FIXTURE), str(fake_state), mode))
+                                     process_command=(sys.executable, str(FIXTURE), str(fake_state), mode), command_approval=approval)
 
     return root, config, fake_state, make
 

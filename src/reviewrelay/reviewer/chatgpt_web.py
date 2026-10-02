@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import asyncio
 from collections import OrderedDict
-from dataclasses import replace
+from dataclasses import asdict, replace
 from datetime import datetime, timezone
 import hashlib
 import logging
@@ -733,9 +733,20 @@ class ChatGPTWebAdapter:
                 else:
                     composer = await self._find_composer()
                     send_button = await first_visible(self.selectors.send_button_candidates(self.page))
-                    composer_ready = composer is not None and send_button is not None
+                    # Modern ChatGPT replaces empty-composer Send with Start Voice.
+                    # A response's completed action footer proves that boundary.
+                    completed_footer = send_button is None and await self._has_response_completion_footer(identity)
+                    composer_ready = composer is not None and (send_button is not None or completed_footer)
                     now = asyncio.get_running_loop().time()
                     if composer_ready and stable_since is not None and now - stable_since >= self.settings.timeouts.stability_seconds:
+                        # Rendering can append another reply between the count
+                        # snapshot and completion controls. Recheck before capture.
+                        current = [(i, t) for i, t in await self._read_turns("assistant")
+                                   if i not in send_result.pre_send_baseline.assistant_turn_ids]
+                        if len(current) > 1:
+                            raise AmbiguousResponse("Multiple new assistant turns appeared at completion", send_result=send_result)
+                        if current != [(identity, text)]:
+                            continue
                         if not text.strip():
                             raise ResponseExtractionFailed("The new assistant turn is empty", send_result=send_result)
                         response = AssistantResponse(
@@ -1028,6 +1039,14 @@ class ChatGPTWebAdapter:
         return await composer.evaluate(
             """el => {
                 const blocks = Array.from(el.children);
+                if (el.classList.contains("ProseMirror") && blocks.every(block => block.tagName === "P")) {
+                    // Each paragraph is one line; an empty paragraph preserves
+                    // a blank line. Inline link layout must not add newlines.
+                    const text = node => node.nodeType === Node.TEXT_NODE ? node.textContent :
+                        node.nodeName === "BR" ? (node.classList.contains("ProseMirror-trailingBreak") ? "" : "\\n") :
+                        Array.from(node.childNodes).map(text).join("");
+                    return blocks.map(text).join("\\n");
+                }
                 const blockTags = new Set(["P", "DIV", "LI", "PRE", "BLOCKQUOTE"]);
                 if (blocks.length && blocks.every(block => blockTags.has(block.tagName))) {
                     return blocks
@@ -1039,6 +1058,41 @@ class ChatGPTWebAdapter:
                 return el.innerText ?? "";
             }"""
         )
+
+    async def discard_unsent_prompt(self, *, prompt: str, conversation_url: str) -> dict[str, Any]:
+        """Clear only the exact persisted relay draft after a proven pre-click failure.
+
+        The controller must first prove that send never crossed the click boundary.
+        This method performs no send and never clears a different Owner draft.
+        """
+        if self._active_conversation_url != conversation_url or self._page is None:
+            await self.open_task_conversation(conversation_url)
+        self._assert_conversation_unchanged(self._navigation_generation, conversation_url)
+        await self._raise_if_login_required()
+        baseline = await self._capture_baseline()
+        _, composer = await self._require_composer()
+        actual = await self._read_composer_text(composer)
+        # ChatGPT's restored draft can flatten paragraph boundaries to one LF.
+        # Accept only that observed representation, never arbitrary whitespace
+        # changes, and only for the ProseMirror restored paragraph shape.
+        restored_shape = await composer.evaluate(
+            "el => el.classList.contains('ProseMirror') && el.children.length > 0 && [...el.children].every(c => c.tagName === 'P')")
+        restored_match = restored_shape and actual == prompt.replace("\n\n", "\n")
+        if (actual != prompt and not restored_match
+                or await self._has_visible_stop_button()
+                or await self._visible_composer_attachment_count()
+                or any(_normalize_turn_text(text) == _normalize_turn_text(prompt)
+                       for _, text in await self._read_turns("user"))):
+            raise ReviewerConversationChanged("Cannot prove this is the untouched, unsent relay draft")
+        if await self._capture_baseline() != baseline:
+            raise ReviewerConversationChanged("Conversation changed during unsent-draft reconciliation")
+        await composer.fill("")
+        if (await self._read_composer_text(composer)).strip() or await self._capture_baseline() != baseline:
+            raise ReviewerConversationChanged("Unsent draft cleanup could not be verified")
+        return {"conversation_url": conversation_url, "prompt_sha256": hashlib.sha256(prompt.encode()).hexdigest(),
+                "baseline": asdict(baseline), "draft_cleared": True,
+                "draft_sha256": hashlib.sha256(actual.encode()).hexdigest(),
+                "restored_paragraph_boundaries": actual != prompt}
 
     async def _raise_if_login_required(self) -> None:
         current_url = self.page.url
@@ -1072,15 +1126,101 @@ class ChatGPTWebAdapter:
                 element = locator.nth(index)
                 if not await element.is_visible():
                     continue
-                text = await element.inner_text()
+                content = element.locator(self.selectors.user_message_content) if role == "user" else None
+                if content is not None and await content.count() == 1:
+                    text = await content.evaluate("""el => {
+                        const text = node => node.nodeType === Node.TEXT_NODE ? node.textContent :
+                            node.nodeName === 'BR' ? '\\n' :
+                            node.getAttribute?.('aria-hidden') === 'true' || node.getAttribute?.('data-markdown-copy') === 'exclude' ? '' :
+                            [...node.childNodes].map(text).join('');
+                        return [...el.children].map(text).join('\\n\\n');
+                    }""")
+                else:
+                    text = await element.inner_text()
                 identity = (
                     await element.get_attribute("data-message-id")
                     or await element.get_attribute("id")
-                    or f"{role}:{index}"
+                    or await element.get_attribute("data-chatgpt-selection-message-id")
+                    or await element.evaluate("""el => {
+                        const ids = el.closest('[data-chatgpt-search-message-ids]')?.getAttribute('data-chatgpt-search-message-ids');
+                        const unique = [...new Set((ids ?? '').split(/\\s+/).filter(Boolean))];
+                        return unique.length === 1 ? unique[0] : null;
+                    }""")
                 )
+                if not identity:
+                    if self.settings.browser_backend is BrowserBackend.GOOGLE_CHROME_CDP:
+                        raise ReviewerConversationChanged("A live turn has no stable message identity")
+                    identity = f"{role}:{index}"
                 result.append((identity, text))
         except Exception as exc:
             raise ReviewerConversationChanged(f"Could not inspect visible {role} turns ({type(exc).__name__})") from exc
+        return result
+
+    async def _has_response_completion_footer(self, identity: str) -> bool:
+        elements = self.page.locator(self.selectors.assistant_turns)
+        for index in range(await elements.count()):
+            element = elements.nth(index)
+            if await element.get_attribute("data-chatgpt-selection-message-id") != identity:
+                continue
+            # Footer belongs to this exact response's display unit, not a prior turn.
+            unit = element
+            for _ in range(4):
+                unit = unit.locator("xpath=..")
+                if await unit.locator("[data-chatgpt-selection-message-id]").count() != 1:
+                    return False
+                button = unit.get_by_role("button", name="Regenerate response", exact=True)
+                if await button.count() == 1 and await button.is_visible() and await button.is_enabled():
+                    return True
+            return False
+        return False
+
+    async def reconcile_visible_review(self, *, prompt: str, review_key: str,
+                                       conversation_url: str, dispatched_at: str) -> SendResult:
+        """Read-only recovery of one exact prompt and its structurally paired reply.
+
+        Caller must have durable proof that this prompt was absent immediately
+        before the single unresolved send. No click, navigation fallback or resend.
+        """
+        if self._active_conversation_url != conversation_url or self._page is None:
+            await self.open_task_conversation(conversation_url)
+        self._assert_conversation_unchanged(self._navigation_generation, conversation_url)
+        await self._raise_if_login_required()
+        users = await self._read_turns("user")
+        matches = [(i, text) for i, text in users if _normalize_turn_text(text) == _normalize_turn_text(prompt)]
+        if len(matches) != 1 or await self._has_visible_stop_button():
+            raise ReviewerConversationChanged("No unique completed visible relay prompt exists")
+        async def pair_keys(role):
+            locator = self.page.locator(self.selectors.user_turns if role == "user" else self.selectors.assistant_turns)
+            keys = {}
+            for index in range(await locator.count()):
+                el = locator.nth(index)
+                if not await el.is_visible():
+                    continue
+                data = await el.evaluate("""el => {
+                    const unit=el.closest('[data-chatgpt-search-unit-key]');
+                    return {key:unit?.getAttribute('data-chatgpt-search-unit-key'),
+                        id:el.getAttribute('data-chatgpt-selection-message-id') ??
+                          unit?.getAttribute('data-chatgpt-search-message-ids')};
+                }""")
+                ids = set((data.get("id") or "").split())
+                m = re.fullmatch(r"(.+):\d+:(user|assistant)", data.get("key") or "")
+                if len(ids) == 1 and m and m[2] == role:
+                    keys[ids.pop()] = m[1]
+            return keys
+        user_keys, assistant_keys = await pair_keys("user"), await pair_keys("assistant")
+        user_id = matches[0][0]
+        pair = user_keys.get(user_id)
+        assistants = await self._read_turns("assistant")
+        owned = [i for i, text in assistants if pair and assistant_keys.get(i) == pair and text.strip()]
+        _, composer = await self._require_composer()
+        if (len(owned) != 1 or (await self._read_composer_text(composer)).strip()
+                or await self._visible_composer_attachment_count() or not await self._has_response_completion_footer(owned[0])):
+            raise ReviewerConversationChanged("Cannot prove the exact visible prompt/reply pairing is complete")
+        baseline = TurnBaseline(tuple(i for i, _ in users if i != user_id),
+            tuple(i for i, _ in assistants if i != owned[0]), self._navigation_generation)
+        result = SendResult(review_key, conversation_url, dispatched_at, "review", (),
+            hashlib.sha256(prompt.encode()).hexdigest(), baseline, user_id)
+        self._remember(review_key, self._request_signature(conversation_url, "review", prompt, ()), result)
         return result
 
     async def _has_visible_stop_button(self) -> bool:

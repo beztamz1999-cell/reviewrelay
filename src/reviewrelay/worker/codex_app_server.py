@@ -6,6 +6,7 @@ import asyncio
 import os
 import sqlite3
 from collections import deque
+from collections.abc import Awaitable, Callable
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
@@ -44,7 +45,8 @@ def build_app_server_command(settings: CodexWorkerSettings) -> tuple[str, ...]:
 class CodexAppServerAdapter:
     def __init__(self, data_root: PortableDataRoot, config: ProjectConfig, task_id: str,
                  settings: CodexWorkerSettings | None = None, *,
-                 process_command: tuple[str, ...] | None = None) -> None:
+                 process_command: tuple[str, ...] | None = None,
+                 command_approval: Callable[[dict[str, Any]], Awaitable[str]] | None = None) -> None:
         self.data_root = data_root.create()
         self.config = config
         self.task_id = validate_identifier(task_id, "task_id")
@@ -52,6 +54,8 @@ class CodexAppServerAdapter:
         self.storage = TaskStorage(data_root)
         self.state = StateStore(data_root)
         self._command = process_command or build_app_server_command(self.settings)
+        self._command_approval = command_approval
+        self._approval_tasks: set[asyncio.Task] = set()
         self._transport: AppServerTransport | None = None
         self._lock: WorkerTaskLock | None = None
         self._operation_lock = asyncio.Lock()
@@ -190,6 +194,28 @@ class CodexAppServerAdapter:
             self._check_idle()
             return await self._resume()
 
+    async def inspect_last_turn(self) -> str:
+        """Read authoritative terminal status without dispatching or interrupting a turn."""
+        self._check_control_available()
+        async with self._operation_lock:
+            record, repo = self._record(), self._repo()
+            if not record.worker_thread_id or not record.worker_last_turn_id:
+                raise WorkerBindingMismatch("No saved worker turn to reconcile")
+            await self._ensure_ready()
+            result = await self._transport.request("thread/read", {"threadId": record.worker_thread_id, "includeTurns": True})
+            thread = result.get("thread", {})
+            if thread.get("id") != record.worker_thread_id or not isinstance(thread.get("cwd"), str) or not _same_path(thread["cwd"], repo):
+                raise WorkerBindingMismatch("Read thread belongs to another Task repository")
+            turns = thread.get("turns")
+            if not isinstance(turns, list):
+                raise WorkerProtocolError("Read thread has no authoritative turn list")
+            matching = [t for t in turns if isinstance(t, dict) and t.get("id") == record.worker_last_turn_id]
+            if len(matching) != 1 or matching[0].get("status") not in {"completed", "interrupted", "failed"}:
+                raise WorkerTurnAlreadyActive("Saved turn is not authoritatively terminal")
+            status = matching[0]["status"].upper()
+            self._save(worker_last_turn_status=status)
+            return status
+
     async def _resume(self) -> str:
         repo = self._repo()
         record = self._record()
@@ -245,7 +271,8 @@ class CodexAppServerAdapter:
         self._done = asyncio.get_running_loop().create_future()
         self._early_events = []
         self._save(worker_last_turn_id=None, worker_last_turn_status="STARTING", worker_last_event_at=utc_now_iso())
-        params: dict[str, Any] = {"threadId": self._thread_id, "cwd": repo, "input": [{"type": "text", "text": prompt}], "approvalPolicy": "never"}
+        params: dict[str, Any] = {"threadId": self._thread_id, "cwd": repo, "input": [{"type": "text", "text": prompt}],
+                                 "approvalPolicy": "on-request" if self._command_approval else "never"}
         if self.settings.model:
             params["model"] = self.settings.model
         if self.settings.reasoning_effort:
@@ -277,6 +304,14 @@ class CodexAppServerAdapter:
     async def _on_event(self, message: dict[str, Any]) -> None:
         method = message["method"]
         if "id" in message:
+            if method == "item/commandExecution/requestApproval" and self._command_approval:
+                if self._early_events is not None:
+                    if len(self._early_events) >= 1000:
+                        raise WorkerProtocolError("Too many events before turn acknowledgement")
+                    self._early_events.append(message)
+                else:
+                    self._queue_command_approval(message)
+                return
             assert self._transport
             await self._transport.send({"id": message["id"], "error": {"code": -32601, "message": "ReviewRelay Phase 4 does not support interactive server requests"}})
             if method.startswith("account/"):
@@ -295,6 +330,9 @@ class CodexAppServerAdapter:
             await self._consume_event(message)
 
     async def _consume_event(self, message: dict[str, Any]) -> None:
+        if "id" in message:
+            self._queue_command_approval(message)
+            return
         method, params = message["method"], message.get("params", {})
         if method in {"turn/started", "turn/completed", "item/started", "item/completed", "item/agentMessage/delta"}:
             thread_id = _id(params.get("threadId"), "event thread ID")
@@ -383,6 +421,61 @@ class CodexAppServerAdapter:
         else:
             self._emit("TOOL_ACTIVITY" if method.startswith("item/") else "UNKNOWN_EVENT", raw=raw)
 
+    def _queue_command_approval(self, message: dict[str, Any]) -> None:
+        if self._approval_tasks:
+            raise WorkerProtocolError("Another command approval is still pending")
+        async def decide():
+            try:
+                await self._approve_command(message)
+            except WorkerError as exc:
+                self._on_failure(exc)
+            except Exception:
+                self._on_failure(WorkerInteractionRequired("Owner command approval did not complete safely"))
+        task = asyncio.create_task(decide())
+        self._approval_tasks.add(task)
+        task.add_done_callback(self._approval_tasks.discard)
+
+    async def _approve_command(self, message: dict[str, Any]) -> None:
+        """A caller must obtain an Owner decision for this exact command; no session grants."""
+        params = message.get("params", {})
+        if self._trace:
+            self._trace.append(message)
+        command, cwd = params.get("command"), params.get("cwd")
+        record = self._record()
+        if (message.get("method") != "item/commandExecution/requestApproval"
+                or not self._command_approval or not self._transport
+                or not self._done or self._done.done()
+                or params.get("threadId") != self._thread_id
+                or params.get("turnId") != self._turn_id
+                or record.worker_thread_id != self._thread_id
+                or record.worker_last_turn_id != self._turn_id
+                or params.get("kind", "command") != "command"
+                or params.get("environmentId") not in {None, "local"} or params.get("networkApprovalContext")
+                or not isinstance(command, str) or not command.strip() or len(command) > 16384
+                or "\x00" in command or not isinstance(cwd, str) or not _same_path(cwd, self._repo())):
+            raise WorkerBindingMismatch("Command approval does not match the active Task/thread/repository")
+        item_id = _id(params.get("itemId"), "approval item ID")
+        request = {"project_id": self.config.project_id, "task_id": self.task_id,
+                   "thread_id": self._thread_id, "turn_id": self._turn_id,
+                   "item_id": item_id, "command": command, "cwd": cwd, "environment_id": params.get("environmentId")}
+        if self._trace:
+            self._trace.append({"method": "reviewrelay/commandApprovalRequested", "params": request})
+        self._emit("COMMAND_APPROVAL_REQUESTED", item_id=item_id, command=safe_payload(command))
+        # Waiting for the Owner consumes the overall bound, not inference idle time.
+        decision = await self._command_approval(dict(request))
+        if decision not in {"accept", "decline", "cancel"}:
+            raise WorkerInteractionRequired("Only a one-command Owner decision is supported")
+        available = params.get("availableDecisions")
+        if available is not None and (not isinstance(available, list) or decision not in available):
+            raise WorkerInteractionRequired("Owner decision is not offered by this approval request")
+        if self._done.done() or self._record().worker_last_turn_id != self._turn_id:
+            raise WorkerBindingMismatch("Turn changed while waiting for Owner approval")
+        if self._trace:
+            self._trace.append({"method": "reviewrelay/commandApprovalDecided", "params": {**request, "decision": decision}})
+        self._emit("COMMAND_APPROVAL_DECIDED", item_id=item_id, command=safe_payload(command), raw={"decision": decision})
+        await self._transport.send({"id": message["id"], "result": {"decision": decision}})
+        self._last_activity = asyncio.get_running_loop().time()
+
     def _capture_message(self, item: dict[str, Any]) -> None:
         identity = _id(item.get("id"), "agent message ID")
         text = item.get("text")
@@ -409,8 +502,9 @@ class CodexAppServerAdapter:
         try:
             while not self._done.done():
                 now = asyncio.get_running_loop().time()
-                remaining = min(self.settings.timeouts.overall_seconds - (now - self._started_at),
-                                self.settings.timeouts.idle_seconds - (now - self._last_activity))
+                remaining = self.settings.timeouts.overall_seconds - (now - self._started_at)
+                if not self._approval_tasks:
+                    remaining = min(remaining, self.settings.timeouts.idle_seconds - (now - self._last_activity))
                 if remaining <= 0:
                     await self._timeout_turn()
                     break
@@ -480,4 +574,7 @@ class CodexAppServerAdapter:
                 self._done.exception()
             if self._lock:
                 self._lock.close()
+            for task in self._approval_tasks:
+                task.cancel()
+            await asyncio.gather(*self._approval_tasks, return_exceptions=True)
             self.state.close()

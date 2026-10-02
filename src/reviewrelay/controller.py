@@ -20,6 +20,7 @@ from .projects import ProjectRegistry
 from .protocol import ReviewerAction as A, validate_review_response
 from .reviewer.base import ChatGPTWebSettings, SendDisposition
 from .reviewer.chatgpt_web import ChatGPTWebAdapter
+from .reviewer.errors import MessageSendFailed
 from .worker.base import TurnStatus
 from .worker.codex_app_server import CodexAppServerAdapter
 from .worker.lock import WorkerTaskLock
@@ -36,11 +37,13 @@ class _Halt(Exception):
 
 class TaskController(WorkerManagement):
     def __init__(self, root, project_id, *, worker_factory=None, reviewer_factory=None,
-                 publisher_factory=None, evidence_factory=LocalEvidenceExecutor, git=None, checkpoint_observer=None):
+                 publisher_factory=None, evidence_factory=LocalEvidenceExecutor, git=None, checkpoint_observer=None,
+                 command_approval=None):
         self.root, self.project_id = root.create(), validate_identifier(project_id, "project_id")
         self.store = ControllerStore(root)
         self.git = git or ProjectGit()
-        self.worker_factory = worker_factory or (lambda config, task: CodexAppServerAdapter(root, config, task.task_id))
+        self.worker_factory = worker_factory or (lambda config, task: CodexAppServerAdapter(root, config, task.task_id,
+                                                                                     command_approval=command_approval))
         self.reviewer_factory = reviewer_factory or (lambda config: ChatGPTWebAdapter(root, ChatGPTWebSettings.from_mapping(config.chatgpt)))
         self.publisher_factory = publisher_factory or (lambda config: GitHubCandidatePublisher(root, config))
         self.evidence_factory, self.observer = evidence_factory, checkpoint_observer
@@ -339,7 +342,14 @@ class TaskController(WorkerManagement):
             await self.publisher.verify_current(PublishedCandidate(**task.published))
         self._effect(task, key, kind, "PLANNED", payload)
         self._check_control(task)
-        counter = "worker_initial_turns" if kind == "WORKER_INITIAL" else "worker_fix_turns"
+        counter = {"WORKER_INITIAL": "worker_initial_turns", "WORKER_FIX": "worker_fix_turns",
+                   "WORKER_CONTINUATION": "worker_continuation_turns"}[kind]
+        if kind == "WORKER_CONTINUATION":
+            actual = await self.git.discover(config.repo.path)
+            if (actual.head != task.pending["head_before"] or actual.branch != task.pending["branch_before"]
+                    or (await self.git.run(config.repo.path, "ls-files", "--others", "--exclude-standard", "-z"))[0]
+                    or _hash((await self.git.run(config.repo.path, "diff", "HEAD", "--binary"))[0]) != task.pending["diff_digest"]):
+                raise ControllerError("Repository changed before worker continuation", code="TASK_BASELINE_CHANGED")
         # Counter and in-flight intent commit together, before the model call.
         task = self.store.dispatch(task, key, kind, counter)
         self._checkpoint(kind + "_IN_FLIGHT")
@@ -349,7 +359,9 @@ class TaskController(WorkerManagement):
             "Stay within scope. Run relevant tests. Commit the exact tested state locally and finish with a clean worktree. "
             "ReviewRelay owns publication: do not push GitHub. No implementation/audit reports are required.\n"
             + ("The task explicitly permits specification changes.\n" if task.allow_spec_change else "Do not modify the task specification.\n")
-            + (f"Continue this same Task/thread; reviewer instruction for candidate {task.candidate_sha}:\n" if kind == "WORKER_FIX" else "INITIAL TASK INSTRUCTION:\n")
+            + (f"Continue this same Task/thread; reviewer instruction for candidate {task.candidate_sha}:\n" if kind == "WORKER_FIX"
+               else "Continue this exact persisted Task/thread after a proven completed turn:\n" if kind == "WORKER_CONTINUATION"
+               else "INITIAL TASK INSTRUCTION:\n")
             + instruction)
         turn = await self._wait(self.worker.start_task(prompt) if kind == "WORKER_INITIAL" else self.worker.send_instruction(prompt), task, worker=True)
         thread = self.worker.get_session_identity()
@@ -369,9 +381,89 @@ class TaskController(WorkerManagement):
         self._record_worker_events(task, turn)
         return self._save(task, "WORKER_TURN_COMPLETED", state=S.VERIFYING_CANDIDATE)
 
+    async def continue_incomplete_worker(self, identity, instruction):
+        """Explicit Owner recovery of a proven terminal turn that left no valid candidate."""
+        if not isinstance(instruction, str) or not instruction.strip() or "\x00" in instruction or len(instruction) > 16384:
+            raise ControllerError("A bounded continuation instruction is required", code="OWNER_INPUT_INVALID")
+        lock = self._task_lock(identity.task_id)
+        project_lock = None
+        try:
+            project_lock = self._project_lock()
+            task, config = self._worker_binding(identity)
+            record = self.store.state.get(self.project_id, task.task_id)
+            effect = self.store.effect(self._key(task, task.pending.get("worker_kind", ""), task.pending.get("number", -1)))
+            if (task.state is not S.PAUSED_ERROR or task.resume_state != S.VERIFYING_CANDIDATE.value
+                    or task.error_code not in {"CANDIDATE_INVALID_DIRTY_WORKTREE", "WORKER_NO_NEW_COMMIT"}
+                    or task.candidate_sha or task.published or task.review_cycle or task.manual_pending
+                    or task.review_invalidated or self.store.control(self.project_id, task.task_id)
+                    or record.worker_last_turn_status not in {"COMPLETED", "INTERRUPTED", "FAILED"}
+                    or record.worker_last_turn_id != task.worker_turn_id
+                    or not effect or effect["status"] not in {"COMPLETED", "RECONCILED_TERMINAL"}
+                    or effect["payload"].get("turn_id") != task.worker_turn_id
+                    or effect["payload"].get("thread_id") != identity.worker_thread_id):
+                raise ControllerError("Completed worker outcome is not safe to continue", code="WORKER_CONTINUATION_NOT_SAFE")
+            if (effect["status"] == "RECONCILED_TERMINAL" and effect["payload"].get("terminal_status") != record.worker_last_turn_status
+                    or effect["status"] == "COMPLETED" and record.worker_last_turn_status != "COMPLETED"
+                    or self.store.db.execute("SELECT 1 FROM controller_effects WHERE project_id=? AND task_id=? AND effect_key!=? "
+                        "AND status NOT IN ('PLANNED','COMPLETED','RECONCILED_TERMINAL') LIMIT 1",
+                        (self.project_id, task.task_id, effect["effect_key"])).fetchone()):
+                raise ControllerError("Another effect outcome is unresolved", code="WORKER_CONTINUATION_NOT_SAFE")
+            actual = await self.git.discover(config.repo.path)
+            if actual.head != task.base_sha or not actual.branch:
+                raise ControllerError("Task baseline changed", code="TASK_BASELINE_CHANGED")
+            if (await self.git.run(config.repo.path, "ls-files", "--others", "--exclude-standard", "-z"))[0]:
+                raise ControllerError("Reconcile untracked files before continuation", code="WORKER_CONTINUATION_NOT_SAFE")
+            path = self._spec_path(config, task.task_id)
+            if not path.is_file() or _hash(path.read_text(encoding="utf-8")) != task.spec_digest:
+                raise ControllerError("Canonical specification changed", code="TASK_SPEC_MUTATED")
+            number = task.counters.get("worker_continuation_turns", 0) + 1
+            pending = {"worker_kind": "WORKER_CONTINUATION", "number": number, "instruction": instruction,
+                       "head_before": actual.head, "branch_before": actual.branch,
+                       "diff_digest": _hash((await self.git.run(config.repo.path, "diff", "HEAD", "--binary"))[0])}
+            return self._save(task, "OWNER_WORKER_CONTINUATION_PLANNED", state=S.WORKER_RUNNING,
+                pending=pending, error_code=None, ready_for_owner_review=False,
+                owner_inputs=task.owner_inputs + ({"kind": "WORKER_CONTINUATION", **pending,
+                    "worker_thread_id": identity.worker_thread_id, "created_at": utc_now_iso()},))
+        finally:
+            if project_lock:
+                project_lock.close()
+            lock.close()
+
+    async def reconcile_interrupted_continuation(self, identity):
+        """An interrupted, confirmed continuation may be resolved only by server thread/read."""
+        lock = self._task_lock(identity.task_id)
+        project_lock = None
+        try:
+            project_lock = self._project_lock()
+            task, config = self._worker_binding(identity)
+            key = self._key(task, task.pending.get("worker_kind", ""), task.pending.get("number", -1))
+            effect = self.store.effect(key)
+            if (task.state is not S.PAUSED_ERROR or task.resume_state != S.WORKER_RUNNING.value
+                    or task.pending.get("worker_kind") != "WORKER_CONTINUATION" or not effect
+                    or effect["status"] != "CONFIRMED" or effect["payload"].get("thread_id") != identity.worker_thread_id
+                    or effect["payload"].get("turn_id") != task.worker_turn_id
+                    or task.candidate_sha or task.published or self.store.control(self.project_id, task.task_id)):
+                raise ControllerError("Continuation cannot be reconciled safely", code="WORKER_CONTINUATION_NOT_SAFE")
+            self.worker = self.worker_factory(config, task)
+            status = await self.worker.inspect_last_turn()
+            if status not in {"INTERRUPTED", "FAILED"}:
+                raise ControllerError("No proven unsuccessful terminal outcome", code="WORKER_TURN_AMBIGUOUS")
+            self._effect(task, key, "WORKER_CONTINUATION", "RECONCILED_TERMINAL",
+                {**effect["payload"], "terminal_status": status, "proof_source": "thread/read"})
+            return self._save(task, "WORKER_CONTINUATION_TERMINAL_RECONCILED", resume_state=S.VERIFYING_CANDIDATE.value,
+                error_code="CANDIDATE_INVALID_DIRTY_WORKTREE")
+        finally:
+            try:
+                await self._cleanup()
+            finally:
+                if project_lock:
+                    project_lock.close()
+                lock.close()
+
     def _record_worker_events(self, task, turn):
         for event in tuple(getattr(self.worker, "timeline", ())):
-            if event.turn_id == turn and event.kind in {"COMMAND_STARTED", "COMMAND_COMPLETED", "FILE_CHANGE", "TOOL_ACTIVITY", "TURN_STARTED", "TURN_COMPLETED"}:
+            if event.turn_id == turn and event.kind in {"COMMAND_STARTED", "COMMAND_COMPLETED", "COMMAND_APPROVAL_REQUESTED",
+                    "COMMAND_APPROVAL_DECIDED", "FILE_CHANGE", "TOOL_ACTIVITY", "TURN_STARTED", "TURN_COMPLETED"}:
                 with self.store.db:
                     self.store._event(task, "CODEX_" + event.kind, {"turn_id": event.turn_id, "command": event.command,
                         "exit_code": event.exit_code, "paths": event.paths})
@@ -403,6 +495,112 @@ class TaskController(WorkerManagement):
         return self._save(task, kind + "_PLANNED", state=S.SENDING_EVIDENCE if kind == "EVIDENCE_SEND" else S.WAITING_REVIEW,
             message_number=number, pending={"message_kind": kind, "key": self._key(task, kind, number), "prompt": prompt,
             "candidate_sha": task.candidate_sha, "cycle": task.review_cycle}, error_code=None)
+
+    async def reconcile_unsent_review(self, identity):
+        """Explicit recovery for a typed pre-click failure, never an unknown click.
+
+        Legacy journals conservatively marked even pre-click failures ambiguous.
+        MESSAGE_SEND_FAILED with no returned SendResult identifies that boundary;
+        response-stage failures have a persisted SendResult and remain blocked.
+        """
+        lock = self._task_lock(identity.task_id)
+        project_lock = None
+        try:
+            project_lock = self._project_lock()
+            task, config = self._worker_binding(identity)
+            key = task.pending.get("key")
+            effect = self.store.effect(key) if key else None
+            payload = {"candidate_sha": task.candidate_sha, "cycle": task.review_cycle,
+                "conversation_url": config.chatgpt["conversation_url"], "prompt_sha256": _hash(task.pending.get("prompt", ""))}
+            if (task.state is not S.PAUSED_ERROR or task.error_code != "MESSAGE_SEND_FAILED"
+                    or task.resume_state != S.WAITING_REVIEW.value or task.pending.get("message_kind") != "REVIEW_SEND"
+                    or not task.published or task.review_invalidated or self.store.review(key) is not None
+                    or not effect or effect["kind"] != "REVIEW_SEND" or effect["status"] not in {"AMBIGUOUS", "NOT_SENT"}
+                    or effect["payload"] != payload
+                    or task.pending.get("candidate_sha") != task.candidate_sha or task.pending.get("cycle") != task.review_cycle):
+                raise ControllerError("Reviewer effect cannot be proven unsent", code="REVIEW_SEND_AMBIGUOUS")
+            self.publisher = self.publisher_factory(config)
+            await self.publisher.verify_current(PublishedCandidate(**task.published))
+            self.reviewer = self.reviewer_factory(config)
+            proof = await self.reviewer.discard_unsent_prompt(prompt=task.pending["prompt"],
+                conversation_url=config.chatgpt["conversation_url"])
+            if (proof.get("conversation_url") != payload["conversation_url"]
+                    or proof.get("prompt_sha256") != payload["prompt_sha256"] or proof.get("draft_cleared") is not True):
+                raise ControllerError("Unsent-draft proof differs", code="REVIEW_SEND_AMBIGUOUS")
+            await self.publisher.verify_current(PublishedCandidate(**task.published))
+            with self.store.db:
+                self.store._event(task, "REVIEW_PRE_CLICK_FAILURE_RECONCILED", {
+                    "effect_key": key, "prior_status": effect["status"], "error_code": task.error_code,
+                    "proof_source": "typed-pre-click-error-and-exact-visible-draft", **proof})
+            self._effect(task, key, "REVIEW_SEND", "PLANNED", payload)
+            return self._save(task, "REVIEW_SEND_RECONCILED_NOT_SENT", state=S.WAITING_REVIEW, error_code=None)
+        finally:
+            try:
+                await self._cleanup()
+            finally:
+                if project_lock:
+                    project_lock.close()
+                lock.close()
+
+    async def reconcile_visible_review(self, identity):
+        """Recover a UI-confirmed pair after one send following a durable absence proof.
+
+        This narrow recovery never turns an arbitrary ambiguous effect into a
+        retry and never accepts supplied reviewer text or an Owner assertion.
+        """
+        lock = self._task_lock(identity.task_id)
+        project_lock = None
+        try:
+            project_lock = self._project_lock()
+            task, config = self._worker_binding(identity)
+            key = task.pending.get("key")
+            effect = self.store.effect(key) if key else None
+            payload = {"candidate_sha": task.candidate_sha, "cycle": task.review_cycle,
+                "conversation_url": config.chatgpt["conversation_url"], "prompt_sha256": _hash(task.pending.get("prompt", ""))}
+            if (task.state is not S.PAUSED_ERROR or task.error_code != "MESSAGE_SEND_AMBIGUOUS"
+                    or task.resume_state != S.WAITING_REVIEW.value or task.pending.get("message_kind") != "REVIEW_SEND"
+                    or not task.published or task.review_invalidated or self.store.review(key) is not None
+                    or not effect or effect["kind"] != "REVIEW_SEND" or effect["status"] != "AMBIGUOUS"
+                    or {k: v for k, v in effect["payload"].items() if k != "send_result"} != payload
+                    or task.pending.get("candidate_sha") != task.candidate_sha or task.pending.get("cycle") != task.review_cycle):
+                raise ControllerError("Reviewer pair recovery is not applicable", code="REVIEW_SEND_AMBIGUOUS")
+            events = [e for e in self.store.events(self.project_id, task.task_id) if e["source"] == "CONTROLLER"]
+            proofs = [e for e in events if e["kind"] == "REVIEW_PRE_CLICK_FAILURE_RECONCILED"
+                and json.loads(e["payload_json"]).get("effect_key") == key]
+            proof = json.loads(proofs[-1]["payload_json"]) if proofs else {}
+            later = [e for e in events if proofs and e["sequence"] > proofs[-1]["sequence"] and e["kind"].endswith("_IN_FLIGHT")]
+            if (proof.get("proof_source") != "typed-pre-click-error-and-exact-visible-draft"
+                    or proof.get("draft_cleared") is not True or proof.get("prompt_sha256") != payload["prompt_sha256"]
+                    or proof.get("conversation_url") != payload["conversation_url"]
+                    or len(later) != 1 or later[0]["kind"] != "REVIEW_SEND_IN_FLIGHT"
+                    or json.loads(later[0]["payload_json"]).get("effect_key") != key):
+                raise ControllerError("A unique send after a durable prompt-absence proof is required", code="REVIEW_SEND_AMBIGUOUS")
+            self.publisher = self.publisher_factory(config)
+            await self.publisher.verify_current(PublishedCandidate(**task.published))
+            self.reviewer = self.reviewer_factory(config)
+            sent = await self.reviewer.reconcile_visible_review(prompt=task.pending["prompt"], review_key=key,
+                conversation_url=payload["conversation_url"], dispatched_at=later[0]["created_at"])
+            if (sent.review_key != key or sent.conversation_url != payload["conversation_url"]
+                    or sent.prompt_sha256 != payload["prompt_sha256"] or sent.attachment_paths
+                    or sent.disposition is not SendDisposition.SEND_CONFIRMED):
+                raise ControllerError("Recovered send ownership differs", code="REVIEW_OWNERSHIP_INVALID")
+            response = await self._wait(self.reviewer.wait_response(sent), task, guard=True)
+            if (response.review_key != key or response.conversation_url != sent.conversation_url
+                    or response.disposition is not SendDisposition.RESPONSE_RECEIVED or response.sent_at != sent.sent_at
+                    or not response.assistant_turn_identity or response.assistant_turn_identity in sent.pre_send_baseline.assistant_turn_ids):
+                raise ControllerError("Recovered response ownership differs", code="REVIEW_OWNERSHIP_INVALID")
+            await self.publisher.verify_current(PublishedCandidate(**task.published))
+            self.store.put_review(task, key, response.text, asdict(response))
+            self._effect(task, key, "REVIEW_SEND", "COMPLETED", {**payload, "send_result": asdict(sent),
+                "response_identity": response.assistant_turn_identity, "reconciled": True})
+            return self._save(task, "VISIBLE_REVIEW_PAIR_RECONCILED", state=S.WAITING_REVIEW, error_code=None)
+        finally:
+            try:
+                await self._cleanup()
+            finally:
+                if project_lock:
+                    project_lock.close()
+                lock.close()
 
     async def _review(self, task, config):
         key, kind, prompt = task.pending["key"], task.pending["message_kind"], task.pending["prompt"]
@@ -443,8 +641,21 @@ class TaskController(WorkerManagement):
                 self._checkpoint("REVIEW_RAW_CAPTURED")
                 self._effect(task, key, kind, "COMPLETED", {**payload, "response_identity": response.assistant_turn_identity})
                 raw = self.store.review(key)
-            except Exception:
-                self._effect(task, key, kind, "AMBIGUOUS", payload)
+            except Exception as exc:
+                failed_send = getattr(exc, "send_result", None)
+                if (failed_send is not None and failed_send.review_key == key
+                        and failed_send.conversation_url == payload["conversation_url"]
+                        and failed_send.prompt_sha256 == payload["prompt_sha256"]):
+                    payload = {**payload, "send_result": asdict(failed_send)}
+                # Only the transport's typed failure before any SendResult is
+                # definitively unsent. Unknown clicks/response failures stay blocked.
+                status = "NOT_SENT" if (isinstance(exc, MessageSendFailed) and exc.send_state == "NOT_SENT"
+                    and exc.send_result is None and "send_result" not in payload) else "AMBIGUOUS"
+                self._effect(task, key, kind, status, payload)
+                with self.store.db:
+                    self.store._event(task, "REVIEW_TRANSPORT_FAILED", {"effect_key": key,
+                        "error_code": getattr(exc, "code", "REVIEW_FAILED"),
+                        "send_state": getattr(exc, "send_state", "UNKNOWN"), "reason": str(exc)[:2048]})
                 raise
         decision = validate_review_response(raw["raw_text"], expected_candidate_sha=task.candidate_sha,
             expected_cycle=task.review_cycle, project_config=config)

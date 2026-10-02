@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import replace
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 import threading
@@ -206,6 +207,144 @@ def test_contenteditable_paragraphs_reconstruct_prompt_newlines(fixture_server, 
         finally:
             await adapter.close()
 
+    _run(run())
+
+
+def test_prosemirror_draft_preserves_blank_lines_and_inline_link_text(fixture_server, tmp_path):
+    async def run():
+        settings = _settings(fixture_server, "ask-chatgpt")
+        settings = replace(settings, timeouts=replace(settings.timeouts, navigation_seconds=3))
+        adapter = ChatGPTWebAdapter(tmp_path / "prosemirror", settings)
+        prompt = "REVIEWRELAY_REVIEW_REQUEST\n\nREPO_URL=https://github.com/owner/project\nHEAD_SHA=abc\n\nReview this."
+        try:
+            await adapter.open_task_conversation()
+            _, composer = await adapter._require_composer()
+            await composer.evaluate("""(el, text) => {
+                el.classList.add('ProseMirror');
+                el.replaceChildren(...text.split('\\n').map(chunk => {
+                    const p = document.createElement('p'); p.textContent = chunk; return p;
+                }));
+                const p = el.children[2]; p.replaceChildren(document.createTextNode('REPO_URL='));
+                const link = document.createElement('a'); link.style.display = 'block';
+                link.textContent = 'https://github.com/owner/project'; p.append(link);
+                const blank = el.children[1]; const br = document.createElement('br');
+                br.className = 'ProseMirror-trailingBreak'; blank.append(br);
+            }""", prompt)
+            assert await adapter._read_composer_text(composer) == prompt
+            proof = await adapter.discard_unsent_prompt(prompt=prompt, conversation_url=adapter.settings.conversation_url)
+            assert proof["draft_cleared"] is True
+            assert not (await adapter._read_composer_text(composer)).strip()
+            assert await adapter.page.locator(adapter.selectors.user_turns).count() == 1
+        finally:
+            await adapter.close()
+    _run(run())
+
+
+@pytest.mark.parametrize("changed", [False, True])
+def test_restored_single_paragraph_draft_accepts_only_exact_boundary_flattening(fixture_server, tmp_path, changed):
+    async def run():
+        settings = _settings(fixture_server)
+        settings = replace(settings, timeouts=replace(settings.timeouts, navigation_seconds=3))
+        adapter = ChatGPTWebAdapter(tmp_path / "restored-draft", settings)
+        prompt = "REVIEWRELAY_REVIEW_REQUEST\n\nHEAD_SHA=abc\n\nReview exactly this."
+        try:
+            await adapter.open_task_conversation()
+            _, composer = await adapter._require_composer()
+            text = prompt.replace("\n\n", "\n").replace("abc", "different" if changed else "abc")
+            await composer.evaluate("""(el, text) => {
+                el.classList.add('ProseMirror'); const p = document.createElement('p');
+                p.textContent = text; el.replaceChildren(p);
+            }""", text)
+            if changed:
+                with pytest.raises(ReviewerConversationChanged):
+                    await adapter.discard_unsent_prompt(prompt=prompt, conversation_url=adapter.settings.conversation_url)
+                assert await adapter._read_composer_text(composer) == text
+            else:
+                proof = await adapter.discard_unsent_prompt(prompt=prompt, conversation_url=adapter.settings.conversation_url)
+                assert proof['restored_paragraph_boundaries'] is True
+                assert not (await adapter._read_composer_text(composer)).strip()
+        finally:
+            await adapter.close()
+    _run(run())
+
+
+@pytest.mark.parametrize("mutation", ["owner_draft", "already_sent", "generating", "attachment"])
+def test_unsent_draft_cleanup_fails_closed(fixture_server, tmp_path, mutation):
+    async def run():
+        settings = _settings(fixture_server)
+        settings = replace(settings, timeouts=replace(settings.timeouts, navigation_seconds=3))
+        adapter = ChatGPTWebAdapter(tmp_path / mutation, settings)
+        try:
+            await adapter.open_task_conversation()
+            _, composer = await adapter._require_composer()
+            await composer.fill("Owner draft" if mutation == "owner_draft" else "relay draft")
+            if mutation == "already_sent":
+                await adapter.page.locator(adapter.selectors.user_turns).first.evaluate("el => el.innerText = 'relay draft'")
+            elif mutation == "generating":
+                await adapter.page.locator("#stop").evaluate("el => el.hidden = false")
+            elif mutation == "attachment":
+                await adapter.page.evaluate("""() => {
+                    const chip = document.createElement('button'); chip.setAttribute('aria-label', 'Remove draft.txt');
+                    document.querySelector('#composer').parentElement.append(chip);
+                }""")
+            before = await adapter._read_composer_text(composer)
+            with pytest.raises(ReviewerConversationChanged):
+                await adapter.discard_unsent_prompt(prompt="relay draft", conversation_url=adapter.settings.conversation_url)
+            assert await adapter._read_composer_text(composer) == before
+        finally:
+            await adapter.close()
+    _run(run())
+
+
+@pytest.mark.parametrize("mutation", [None, "duplicate", "wrong_pair", "no_footer", "owner_draft"])
+def test_visible_pair_recovery_reads_exact_rich_prompt_with_stable_ids_without_resend(fixture_server, tmp_path, mutation):
+    async def run():
+        settings = _settings(fixture_server)
+        settings = replace(settings, timeouts=replace(settings.timeouts, navigation_seconds=3))
+        adapter = ChatGPTWebAdapter(tmp_path / "visible-pair", settings)
+        prompt = "REVIEWRELAY_REVIEW_REQUEST\n\nREPO_URL=https://github.com/owner/project\nHEAD_SHA=abc"
+        try:
+            await adapter.open_task_conversation()
+            await adapter.page.evaluate("""({prompt, mutation}) => {
+                const conversation = document.querySelector('#conversation');
+                const userUnit = document.createElement('div');
+                userUnit.setAttribute('data-chatgpt-search-unit-key', 'fallback-turn-9:0:user');
+                userUnit.setAttribute('data-chatgpt-search-message-ids', 'uuid-user');
+                const bubble = document.createElement('div'); bubble.className = 'bg-user-message';
+                const rich = document.createElement('div'); rich.setAttribute('data-markdown-text-tone', 'user-message');
+                const p1 = document.createElement('p'); p1.textContent = 'REVIEWRELAY_REVIEW_REQUEST';
+                const p2 = document.createElement('p'); p2.append(document.createTextNode('REPO_URL='));
+                const a = document.createElement('a'); a.style.display = 'block'; a.textContent = 'https://github.com/owner/project';
+                p2.append(a, document.createElement('br'), document.createTextNode('HEAD_SHA=abc'));
+                rich.append(p1, p2); bubble.append(rich);
+                const expand = document.createElement('button'); expand.textContent = 'Show more'; bubble.append(expand);
+                userUnit.append(bubble); conversation.append(userUnit);
+                if (mutation === 'duplicate') conversation.append(userUnit.cloneNode(true));
+                const replyUnit = document.createElement('div');
+                replyUnit.setAttribute('data-chatgpt-search-unit-key', mutation === 'wrong_pair' ? 'fallback-turn-8:2:assistant' : 'fallback-turn-9:2:assistant');
+                const reply = document.createElement('div'); reply.className = 'group min-w-0 flex-col';
+                reply.setAttribute('data-chatgpt-selection-message-id', 'uuid-assistant');
+                const markdown = document.createElement('div'); markdown.className = 'MarkdownRoot-fixture'; markdown.textContent = 'Owned response';
+                reply.append(markdown); replyUnit.append(reply);
+                if (mutation !== 'no_footer') {
+                    const regenerate = document.createElement('button'); regenerate.setAttribute('aria-label', 'Regenerate response'); replyUnit.append(regenerate);
+                }
+                conversation.append(replyUnit); document.querySelector('#send').remove();
+                if (mutation === 'owner_draft') document.querySelector('#composer').innerText = 'Owner draft';
+            }""", {"prompt": prompt, "mutation": mutation})
+            assert (await adapter._read_turns('user'))[-1] == ('uuid-user', prompt)
+            if mutation:
+                with pytest.raises(ReviewerConversationChanged):
+                    await adapter.reconcile_visible_review(prompt=prompt, review_key='exact-key', conversation_url=settings.conversation_url, dispatched_at='2026-10-02T00:00:00Z')
+            else:
+                assert await adapter._has_response_completion_footer('uuid-assistant')
+                sent = await adapter.reconcile_visible_review(prompt=prompt, review_key='exact-key', conversation_url=settings.conversation_url, dispatched_at='2026-10-02T00:00:00Z')
+                response = await adapter.wait_response(sent)
+                assert sent.user_turn_identity == 'uuid-user'
+                assert response.assistant_turn_identity == 'uuid-assistant' and response.text == 'Owned response'
+            assert await adapter.page.evaluate('window.sendClicks') == 0
+        finally:
+            await adapter.close()
     _run(run())
 
 

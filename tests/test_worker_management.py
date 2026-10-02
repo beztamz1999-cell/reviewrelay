@@ -62,6 +62,25 @@ def test_two_tasks_selection_targets_exact_thread_repo_branch_without_new_thread
     c.close()
 
 
+@pytest.mark.parametrize("mutation", ["kind", "proof", "terminal", "thread", "turn", "status"])
+def test_unproven_historical_terminal_effect_keeps_owner_pause_pending(h, mutation):
+    c, task, identity = completed(h)
+    record = c.store.state.get(h.project.project_id, task.task_id)
+    payload = {"proof_source": "thread/read", "terminal_status": "INTERRUPTED",
+        "thread_id": identity.worker_thread_id, "turn_id": "historical-interrupted-turn"}
+    kind, status = "WORKER_CONTINUATION", "RECONCILED_TERMINAL"
+    if mutation == "kind": kind = "REVIEW_SEND"
+    elif mutation == "proof": payload.pop("proof_source")
+    elif mutation == "terminal": payload["terminal_status"] = "IN_PROGRESS"
+    elif mutation == "thread": payload["thread_id"] = "foreign-thread"
+    elif mutation == "turn": payload["turn_id"] = record.worker_last_turn_id
+    elif mutation == "status": status = "AMBIGUOUS"
+    c.store.put_effect(task, "unproven-past-effect", kind, status, payload)
+    assert c.request_worker_pause(identity).status is WorkerStatus.PAUSE_PENDING
+    assert not h.manuals and h.initial == h.sends == 1
+    c.close()
+
+
 @pytest.mark.parametrize("field,value", [("project_id", "unrelated"), ("worker_thread_id", "replacement"),
     ("repository", "C:/different-repository"), ("task_branch", "different-branch"), ("task_id", "OTHER-TASK")])
 def test_foreign_or_stale_worker_selection_rejected_before_effect(h, field, value):

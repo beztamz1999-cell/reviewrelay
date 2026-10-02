@@ -438,10 +438,9 @@ class ChatGPTWebAdapter:
         self._page = matching[0]
         self._track_page(self._page)
         await self._raise_if_login_required()
-        composer = await self._find_composer()
-        if composer is None:
-            raise ConversationNotReady(await self._diagnostic("restored conversation has no usable composer"))
         await self._wait_for_live_ui_ready()
+        if not self._same_conversation(self.page.url, target):
+            raise ConversationNavigationFailed("Restored tab left the configured conversation while loading")
         self._active_conversation_url = target
         return target
 
@@ -454,7 +453,9 @@ class ChatGPTWebAdapter:
         last_snapshot: tuple[int, int, tuple[str, ...]] | None = None
         while asyncio.get_running_loop().time() < deadline:
             await self._raise_if_login_required()
-            loading = False
+            # CDP can attach before Chrome has hydrated the restored composer.
+            # Missing UI is not readiness; keep waiting within the existing bound.
+            loading = await self._find_composer() is None
             statuses = self.page.locator("[role='status']")
             try:
                 for index in range(await statuses.count()):

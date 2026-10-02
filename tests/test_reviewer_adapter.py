@@ -81,7 +81,9 @@ def _settings(base_url: str, mode: str = "normal", *, stability: float = 0.03) -
         conversation_url=f"{base_url}c/test?mode={mode}",
         headless=True,
         timeouts=ChatGPTTimeouts(
-            navigation_seconds=0.35,
+            # This also bounds cold Chromium startup on Windows. Keep upload
+            # and response failure deadlines short, without racing process launch.
+            navigation_seconds=3,
             upload_seconds=0.35,
             response_seconds=0.8,
             stability_seconds=stability,
@@ -397,6 +399,57 @@ def test_cdp_backend_reuses_exact_existing_conversation_tab_without_navigation(f
             await browser.close()
             await manager.stop()
 
+    _run(run())
+
+
+@pytest.mark.parametrize("outcome", ["delayed", "missing", "login", "different-url"])
+def test_restored_cdp_composer_readiness_is_bounded_and_fail_closed(fixture_server, tmp_path, outcome):
+    async def run():
+        from playwright.async_api import async_playwright
+
+        async with async_playwright() as manager:
+            browser = await manager.chromium.launch(headless=True)
+            context = await browser.new_context()
+            page = await context.new_page()
+            target = f"{fixture_server}c/test"
+            await page.goto(target)
+            await page.evaluate("""outcome => {
+                const composer = document.querySelector('#composer');
+                composer.style.display = 'none';
+                if (outcome !== 'missing') setTimeout(() => {
+                    if (outcome === 'login') {
+                        const button = document.createElement('button');
+                        button.textContent = 'Log in'; document.body.append(button);
+                    } else {
+                        composer.style.display = '';
+                        if (outcome === 'different-url') history.pushState({}, '', '/c/foreign');
+                    }
+                }, 400);
+            }""", outcome)
+            navigations = []
+            page.on("framenavigated", lambda frame: navigations.append(frame.url))
+            class ConnectedBrowser:
+                contexts = [context]
+                def is_connected(self):
+                    return True
+            adapter = ChatGPTWebAdapter(tmp_path / "restored-composer", ChatGPTWebSettings(
+                base_url=fixture_server, conversation_url=target, browser_backend=BrowserBackend.GOOGLE_CHROME_CDP,
+                timeouts=ChatGPTTimeouts(navigation_seconds=4 if outcome in {"delayed", "different-url"} else 1)))
+            adapter._browser, adapter._context, adapter._page = ConnectedBrowser(), context, page
+            try:
+                if outcome == "delayed":
+                    assert await asyncio.wait_for(adapter.open_task_conversation(), timeout=5) == target
+                    assert await adapter._find_composer() is not None
+                else:
+                    error = {"missing": ConversationNotReady, "login": LoginRequired,
+                        "different-url": ConversationNavigationFailed}[outcome]
+                    with pytest.raises(error):
+                        await asyncio.wait_for(adapter.open_task_conversation(), timeout=5)
+                if outcome != "different-url":
+                    assert navigations == []
+                assert await page.evaluate("window.sendClicks") == 0
+            finally:
+                await browser.close()
     _run(run())
 
 

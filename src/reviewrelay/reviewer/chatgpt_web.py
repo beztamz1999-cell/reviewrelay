@@ -464,6 +464,20 @@ class ChatGPTWebAdapter:
                     # A loading status may disappear after is_visible(); keep polling
                     # instead of waiting Playwright's default 30 seconds on a lost node.
                     label = (await status.inner_text(timeout=250)).strip().lower()
+                    if label.startswith("loading older message"):
+                        # ChatGPT retains a lazy history sentinel above the current
+                        # viewport. It does not block an already loaded composer;
+                        # the stable turn/attachment snapshot below still gates sends.
+                        in_viewport = await status.evaluate(
+                            """el => {
+                                const r = el.getBoundingClientRect();
+                                return r.bottom > 0 && r.top < window.innerHeight
+                                    && r.right > 0 && r.left < window.innerWidth;
+                            }""",
+                            timeout=250,
+                        )
+                        if not in_viewport:
+                            continue
                     if label.startswith(("loading conversation", "loading message", "loading older message")):
                         loading = True
                         break

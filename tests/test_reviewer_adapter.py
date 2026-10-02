@@ -487,6 +487,52 @@ def test_restored_loading_status_disappearing_during_read_does_not_overrun_readi
     _run(run())
 
 
+@pytest.mark.parametrize("label,offscreen,ready", [
+    ("Loading older messages…", True, True),
+    ("Loading older messages…", False, False),
+    ("Loading conversation…", True, False),
+    ("Loading messages…", True, False),
+])
+def test_restored_lazy_history_only_ignores_offscreen_older_loader(
+    fixture_server, tmp_path, label, offscreen, ready
+):
+    async def run():
+        from playwright.async_api import async_playwright
+
+        async with async_playwright() as manager:
+            browser = await manager.chromium.launch(headless=True)
+            page = await browser.new_page()
+            target = f"{fixture_server}c/test"
+            await page.goto(target)
+            await page.evaluate("""({label,offscreen}) => {
+                const status = document.createElement('div');
+                status.role = 'status'; status.textContent = label;
+                status.style.cssText = 'position:fixed;left:20px;top:'
+                    + (offscreen ? '-200px' : '20px') + ';height:30px';
+                document.body.append(status);
+                const draft = document.createElement('div');
+                draft.dataset.testid = 'attachment-chip'; draft.textContent = 'owner-draft.txt';
+                document.querySelector('#attachments').append(draft);
+            }""", {"label": label, "offscreen": offscreen})
+            adapter = ChatGPTWebAdapter(tmp_path / "lazy-history", ChatGPTWebSettings(
+                base_url=fixture_server, conversation_url=target,
+                browser_backend=BrowserBackend.GOOGLE_CHROME_CDP,
+                timeouts=ChatGPTTimeouts(navigation_seconds=5 if ready else 0.5)))
+            adapter._page = page
+            try:
+                if ready:
+                    await asyncio.wait_for(adapter._wait_for_live_ui_ready(), timeout=4)
+                else:
+                    with pytest.raises(ConversationNotReady):
+                        await adapter._wait_for_live_ui_ready()
+                assert await adapter._visible_attachment_names() == ["owner-draft.txt"]
+                assert await page.evaluate("window.sendClicks") == 0
+            finally:
+                await browser.close()
+
+    _run(run())
+
+
 def test_lazy_file_input_is_waited_for_after_add_files_menu(fixture_server, tmp_path):
     async def run():
         data = PortableDataRoot(tmp_path / "lazy-upload").create()

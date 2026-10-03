@@ -23,12 +23,12 @@ def active_request(h):
     task = c.store.save(replace(task, state=S.WORKER_RUNNING,
         pending={"worker_kind": "WORKER_INITIAL", "number": 0}), "fixture")
     record = c.store.state.get(task.project_id, task.task_id)
-    c.store.state.save(replace(record, worker_thread_id="thread-1", worker_session_identity="thread-1",
+    c.store.state.save(replace(record, worker_thread_id=task.worker_thread_id, worker_session_identity=task.worker_thread_id,
         worker_repo_path=str(h.repo), worker_last_turn_id="turn-1", worker_last_turn_status="IN_PROGRESS"))
     key = c._key(task, "WORKER_INITIAL", 0)
     c.store.put_effect(task, key, "WORKER_INITIAL", "IN_FLIGHT", {})
     c.close()
-    return dict(project_id=task.project_id, task_id=task.task_id, thread_id="thread-1", turn_id="turn-1",
+    return dict(project_id=task.project_id, task_id=task.task_id, thread_id=task.worker_thread_id, turn_id="turn-1",
         item_id="command-1", command="git status --short\n# exact harmless command", cwd=str(h.repo), environment_id=None)
 
 
@@ -207,7 +207,7 @@ def test_unproven_terminal_worker_remains_paused(window, h, app):
     window.recovery_button.click()
     spin(app, lambda: not window.busy, timeout=120)
     assert "Trạng thái: Tạm dừng do lỗi" in window.summary.text()
-    assert "WORKER_TURN_AMBIGUOUS" in window.message.text()
+    assert "WORKER_TURN_AMBIGUOUS" in window.diagnostic_error.text()
     assert h.initial == h.continuations == 1 and h.sends == 0
 
 
@@ -251,7 +251,7 @@ def test_runtime_recovery_proof_failure_stays_paused_and_never_sends(window, h, 
     window.recovery_button.click()
     spin(app, lambda: not window.busy, timeout=120)
     assert "Trạng thái: Tạm dừng do lỗi" in window.summary.text() and h.sends == sends
-    assert "REVIEWER_CONVERSATION_CHANGED" in window.message.text()
+    assert "REVIEWER_CONVERSATION_CHANGED" in window.diagnostic_error.text()
 
 
 @pytest.mark.parametrize("mutation", ["no_proof", "extra_dispatch", "payload", "foreign", "other_effect"])

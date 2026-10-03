@@ -20,7 +20,7 @@ import time
 from dataclasses import replace
 
 from PySide6.QtCore import QThread, QTimer
-from PySide6.QtWidgets import QApplication, QCheckBox, QDialog, QFileDialog, QInputDialog
+from PySide6.QtWidgets import QApplication, QCheckBox, QDialog, QDialogButtonBox, QFileDialog, QInputDialog, QLabel
 
 from reviewrelay.controller import TaskController
 from reviewrelay.controller_store import ControllerState as S, ControllerStore
@@ -231,7 +231,7 @@ async def transport_probe(config):
 class UiProbe:
     def __init__(self, config, mode, chooser, output):
         self.config, self.mode, self.chooser, self.output = config, mode, chooser, output
-        self.root = disposable_root(config["data_root"] if mode == "ui" else config["fixture_root"])
+        self.root = disposable_root(config["data_root"] if mode in {"ui", "owner"} else config["fixture_root"])
         self.app = QApplication.instance() or QApplication([])
         self.app.setQuitOnLastWindowClosed(False)
         self.result = {"frozen": bool(getattr(sys, "frozen", False)), "executable": sys.executable,
@@ -288,7 +288,7 @@ class UiProbe:
                 (GitHubSetupDialog(project, parent=self.window), "Thiết lập GitHub"),
                 (RuntimeDialog(project, self.window), "Kết nối Codex Runtime"),
                 (ReviewerDialog(project, self.window), "Kết nối ChatGPT Reviewer"),
-                (NewTaskDialog(task_window), "Tạo công việc mới"))
+                (NewTaskDialog(task_window), "Gửi yêu cầu"))
             for index, (dialog, title) in enumerate(dialogs):
                 dialog.show()
                 self.app.processEvents()
@@ -311,6 +311,46 @@ class UiProbe:
             if self.result["snapshot_after"] != self.before:
                 raise ValueError("UI read altered durable state")
             self.finish()
+
+    def tick_owner(self):
+        """Stored-worker Owner UI only; no app-server/model/reviewer effects."""
+        if self.window is None:
+            self.window = ProjectHub(self.root, auto_discover=False)
+            self.window.show()
+            ids = [self.window.projects.item(i).data(256) for i in range(self.window.projects.count())]
+            self.window.projects.setCurrentRow(ids.index(self.config["project_id"]))
+            self.window.open_tasks()
+            if not self.window.task_windows:
+                raise ValueError("Production TaskWindow did not open")
+            return
+        task_window = self.window.task_windows[-1]
+        project = self.window.selected()
+        if not project.codex_worker_thread_id or not project.codex_worker_title:
+            raise ValueError("Fixture requires a stored canonical Project worker")
+        visible = "\n".join(w.text() for w in task_window.findChildren(QLabel) if w.isVisible())
+        if (project.codex_worker_thread_id in visible or "SHA:" in visible or "PROJECT_ID=" in visible
+                or task_window.diagnostics.isVisible() or task_window.new_button.isVisible()
+                or task_window.send_button.text() != "Gửi yêu cầu"
+                or project.codex_worker_title not in task_window.worker_card.label.text()):
+            raise ValueError("Owner view exposes technical fields or omits the stored Worker")
+        dialog = NewTaskDialog(task_window)
+        dialog.show()
+        if hasattr(dialog, "task_id") or hasattr(dialog, "title") or dialog.fix_limit.isVisible():
+            raise ValueError("Normal prompt flow still requires technical fields")
+        dialog.spec.setPlainText("Read-only presentation check; never submitted")
+        if not dialog.buttons.button(QDialogButtonBox.StandardButton.Ok).isEnabled():
+            raise ValueError("Prompt-only dialog is not usable")
+        dialog.reject()
+        task_window.grab().save(str(self.output.with_suffix(".owner.png")))
+        task_window.diagnostics_button.click()
+        if not task_window.diagnostics.isVisible() or project.codex_worker_thread_id not in task_window.project_identity.text():
+            raise ValueError("Diagnostics identity is unavailable")
+        task_window.grab().save(str(self.output.with_suffix(".diagnostics.png")))
+        if durable_snapshot(self.root) != self.before:
+            raise ValueError("Read-only Owner UI changed persisted state")
+        self.result.update(project_opened=True, stored_worker_displayed=True, prompt_only=True,
+            diagnostics_hidden_by_default=True, diagnostics_available=True, durable_unchanged=True)
+        self.finish()
 
     def fixture(self, action=None):
         with ControllerStore(self.root) as store:
@@ -455,7 +495,9 @@ class UiProbe:
         self.timer.start()
         if self.mode != "ui":
             return self.app.exec()
+        import reviewrelay.ui as ui_module
         from reviewrelay.ui import main as ui_main
+        original_hub = ui_module.ProjectHub
         original_args = sys.argv
         original_chooser = QFileDialog.getExistingDirectory
         def choose(parent, caption):
@@ -470,11 +512,15 @@ class UiProbe:
             self.result["chooser_used"] = accepted
             return dialog.selectedFiles()[0] if accepted else ""
         try:
+            # This acceptance mode reads a marked fixture; it must not refresh
+            # operational worker metadata or leave background discovery alive.
+            ui_module.ProjectHub = lambda root: original_hub(root, auto_discover=False)
             sys.argv = [sys.executable] + ([] if self.chooser else ["--data-root", str(self.root.path)])
             if self.chooser:
                 QFileDialog.getExistingDirectory = choose
             return ui_main()
         finally:
+            ui_module.ProjectHub = original_hub
             sys.argv = original_args
             QFileDialog.getExistingDirectory = original_chooser
 
@@ -482,7 +528,7 @@ class UiProbe:
 def main():
     parser = argparse.ArgumentParser(description="Explicit read-only packaged acceptance")
     parser.add_argument("--packaged-smoke", action="store_true", required=True)
-    parser.add_argument("--mode", choices=("ui", "approval", "recovery", "transports", "chatgpt"), required=True)
+    parser.add_argument("--mode", choices=("ui", "owner", "approval", "recovery", "transports", "chatgpt"), required=True)
     parser.add_argument("--config", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--chooser", action="store_true")

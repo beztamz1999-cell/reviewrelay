@@ -248,7 +248,11 @@ class GitHubCandidatePublisher:
                 raise GitHubPublishError("Task is already bound", code="GITHUB_TASK_ALREADY_BOUND")
             project = self._verify_project()
             r = self.state.get(self.config.project_id, task_id)
-            if r is None or r.worker_thread_id or r.candidate_sha or r.review_cycle:
+            canonical_only = bool(r and project and project.codex_worker_thread_id
+                and r.worker_thread_id == r.worker_session_identity == project.codex_worker_thread_id
+                and r.worker_repo_path == project.codex_worker_repo_path
+                and not r.worker_last_turn_id and not r.worker_last_turn_status)
+            if r is None or (r.worker_thread_id and not canonical_only) or r.worker_last_turn_id or r.worker_last_turn_status or r.candidate_sha or r.review_cycle:
                 raise GitHubPublishError("Bind the task spec before implementation", code="TASK_SPEC_BINDING_REQUIRED")
             actual = await asyncio.to_thread(self.git.verify_candidate, self.config.repo.path, strict_commit_mode=True)
             if actual.candidate_sha != r.base_sha:

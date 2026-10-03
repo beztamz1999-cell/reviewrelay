@@ -35,13 +35,13 @@ def test_hub_and_all_setup_dialogs_are_vietnamese(app, project):
     assert hub.windowTitle() == "ReviewRelay — Dự án"
     for attribute, expected in (("create_button", "+ Thêm dự án"), ("github_button", "Kết nối GitHub"),
             ("reviewer_button", "Kết nối ChatGPT Reviewer"), ("codex_button", "Kết nối Codex Worker"),
-            ("tasks_button", "Công việc / + Tạo công việc")):
+            ("tasks_button", "Mở dự án — Gửi yêu cầu")):
         assert getattr(hub, attribute).text() == expected
     dialogs = ((CreateProjectDialog(), "Thêm / Nhập dự án", "Tên dự án"),
         (GitHubSetupDialog(record), "Thiết lập GitHub", "Chế độ review"),
         (ReviewerDialog(record), "Kết nối ChatGPT Reviewer", "URL cuộc trò chuyện ChatGPT"),
         (RuntimeDialog(record), "Kết nối Codex Runtime", "Mức suy luận"),
-        (NewTaskDialog(), "Tạo công việc mới", "Mã công việc"))
+        (NewTaskDialog(), "Gửi yêu cầu", "Bạn muốn Codex làm gì?"))
     for dialog, title, label in dialogs:
         assert dialog.windowTitle() == title
         assert label in [w.text() for w in dialog.findChildren(QLabel)]

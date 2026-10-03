@@ -116,11 +116,16 @@ class WorkerManagement:
             raise ControllerError("Persisted worker repository/branch/thread binding differs", code="WORKER_BINDING_MISMATCH")
         if require_thread and (not identity.worker_thread_id or task.worker_thread_id != identity.worker_thread_id):
             raise ControllerError("Task has no consistent existing worker thread", code="WORKER_THREAD_MISMATCH")
+        self.store.state.assert_project_available(self.project_id, task.task_id)
+        if project.codex_worker_thread_id and identity.worker_thread_id and identity.worker_thread_id != project.codex_worker_thread_id:
+            raise ControllerError("Historical worker is not the current Project worker", code="WORKER_THREAD_MISMATCH")
         return task, config
 
     def _unsafe_for_steer(self, task):
         record = self.store.state.get(self.project_id, task.task_id)
-        if record.worker_thread_id and record.worker_last_turn_status != "COMPLETED":
+        unused_binding = (record.worker_thread_id and not record.worker_last_turn_id
+            and record.worker_last_turn_status is None and not task.worker_turn_id)
+        if record.worker_thread_id and not unused_binding and record.worker_last_turn_status != "COMPLETED":
             return True
         effects = self.store.db.execute("SELECT kind,status,payload_json FROM controller_effects WHERE project_id=? AND task_id=? "
                 "AND status NOT IN ('PLANNED','COMPLETED')", (self.project_id, task.task_id)).fetchall()

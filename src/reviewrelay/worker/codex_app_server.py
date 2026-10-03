@@ -26,6 +26,8 @@ from .errors import (WorkerAuthRequired, WorkerBindingMismatch, WorkerError, Wor
                      WorkerTurnInterrupted)
 from .lock import WorkerTaskLock
 from .transport import AppServerTransport
+from .discovery import verify_thread
+from ..projects import ProjectRegistry, ProjectError
 
 
 def _id(value: Any, label: str) -> str:
@@ -151,6 +153,9 @@ class CodexAppServerAdapter:
         self._check_control_available()
         async with self._operation_lock:
             self._check_idle()
+            with ProjectRegistry(self.data_root) as registry:
+                if any(p.project_id == self.config.project_id for p in registry.list()):
+                    raise WorkerBindingMismatch("Registered Projects must select/create a canonical worker explicitly, then resume it")
             if self._record().worker_thread_id or self._record().worker_session_identity:
                 raise WorkerBindingMismatch("Task already has a worker identity; resume it explicitly")
             repo = self._repo()
@@ -223,12 +228,29 @@ class CodexAppServerAdapter:
             raise WorkerBindingMismatch("Task has no consistent persisted Codex thread binding")
         await self._ensure_ready()
         assert self._transport
+        with ProjectRegistry(self.data_root) as registry:
+            try:
+                project = registry.get(self.config.project_id)
+            except ProjectError as exc:
+                if exc.code != "PROJECT_NOT_FOUND":
+                    raise
+                project = None
+        if project and not project.codex_worker_thread_id:
+            raise WorkerBindingMismatch("Connect the registered Project's canonical worker before use")
+        if project and project.codex_worker_thread_id:
+            if (project.codex_worker_thread_id != record.worker_thread_id
+                    or not _same_path(project.codex_worker_repo_path or "", repo)):
+                raise WorkerBindingMismatch("Task is not bound to the canonical Project worker")
+            result = await self._transport.request("thread/read", {"threadId": record.worker_thread_id, "includeTurns": True})
+            verify_thread(result.get("thread"), repo, record.worker_thread_id)
         if self._thread_id == record.worker_thread_id:
             return self._thread_id
         try:
             # Do not override cwd: inspect the stored thread's repository before any turn.
             result = await self._transport.request("thread/resume", {"threadId": record.worker_thread_id})
             self._validate_thread(result, repo, record.worker_thread_id)
+            if project and project.codex_worker_thread_id:
+                verify_thread(result.get("thread"), repo, record.worker_thread_id)
         except (WorkerRequestFailed, WorkerBindingMismatch) as exc:
             raise WorkerThreadResumeFailed("Could not resume the exact saved Codex thread") from exc
         turns = result["thread"].get("turns")

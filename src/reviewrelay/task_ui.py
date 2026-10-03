@@ -4,10 +4,10 @@ from __future__ import annotations
 import asyncio
 import json
 
-from PySide6.QtCore import QThreadPool, QTimer, Qt
+from PySide6.QtCore import QThreadPool, QTimer, Qt, Signal, Slot
 from PySide6.QtWidgets import (QCheckBox, QDialog, QDialogButtonBox, QFormLayout, QHBoxLayout,
     QInputDialog, QLabel, QLineEdit, QListWidget, QListWidgetItem, QMainWindow, QPushButton,
-    QSpinBox, QTextEdit, QVBoxLayout, QWidget)
+    QSpinBox, QTextEdit, QVBoxLayout, QWidget, QScrollArea)
 
 from .controller import TaskController
 from .approval_ui import CommandApprovalBridge
@@ -17,61 +17,68 @@ from .ui import Job, dialog_buttons, owner_input, explanation
 from .worker_management import worker_view, same_path
 from .owner_recovery import RecoveryAction, recovery_action
 from .ui_text import recovery_text, state_text, detail_text
+from .projects import ProjectRegistry
+from .worker_ui import ProjectWorkerCard
 
 
 class NewTaskDialog(QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("Tạo công việc mới")
+        self.setWindowTitle("Gửi yêu cầu")
         self.resize(720, 680)
         layout = QVBoxLayout(self)
         form = QFormLayout()
-        self.task_id, self.title = QLineEdit(), QLineEdit()
         self.fix_limit, self.evidence_limit = QSpinBox(), QSpinBox()
         for widget, value in ((self.fix_limit, 3), (self.evidence_limit, 5)):
             widget.setRange(0, 100)
             widget.setValue(value)
-        form.addRow("Mã công việc", self.task_id)
-        form.addRow("Tiêu đề", self.title)
         form.addRow("Số vòng sửa tối đa", self.fix_limit)
         form.addRow("Số vòng kiểm chứng tối đa", self.evidence_limit)
-        layout.addLayout(form)
+        self.advanced_button = QPushButton("Tuỳ chọn nâng cao")
+        self.advanced_button.setCheckable(True)
+        advanced = QWidget()
+        advanced_layout = QVBoxLayout(advanced)
+        advanced_layout.addLayout(form)
+        advanced.hide()
+        self.advanced_button.toggled.connect(advanced.setVisible)
+        layout.addWidget(QLabel("Bạn muốn Codex làm gì?"))
         self.spec = QTextEdit()
-        self.spec.setPlaceholderText("Nhập yêu cầu của Owner. ReviewRelay sẽ lưu .reviewrelay/tasks/<TASK_ID>.md thành commit riêng trước khi Codex bắt đầu.")
+        self.spec.setPlaceholderText("Nhập yêu cầu của bạn…")
         layout.addWidget(self.spec)
         self.require_changes = QCheckBox("Yêu cầu commit code mới")
         self.require_changes.setChecked(True)
         self.allow_spec_change = QCheckBox("Cho phép công việc này thay đổi đặc tả gốc")
-        layout.addWidget(self.require_changes)
-        layout.addWidget(self.allow_spec_change)
+        advanced_layout.addWidget(self.require_changes)
+        advanced_layout.addWidget(self.allow_spec_change)
         self.tests = QTextEdit()
         self.tests.setMaximumHeight(80)
         self.tests.setPlaceholderText('Cấu hình test bổ sung của Owner (JSON), ví dụ {"unit": ["python", "-m", "pytest", "-q"]}')
-        layout.addWidget(self.tests)
-        layout.addWidget(explanation("ReviewRelay sẽ lưu yêu cầu công việc thành một commit riêng trước khi Codex bắt đầu. Cần xử lý các thay đổi local khác trước khi tạo. Chọn Bắt đầu để chạy tự động."))
-        self.buttons = dialog_buttons(self, "Tạo công việc")
+        advanced_layout.addWidget(self.tests)
+        layout.addWidget(self.advanced_button)
+        layout.addWidget(advanced)
+        self.buttons = dialog_buttons(self, "Gửi yêu cầu")
         layout.addWidget(self.buttons)
-        for edit in (self.task_id, self.title):
-            edit.textChanged.connect(self.validate)
         self.spec.textChanged.connect(self.validate)
         self.validate()
 
     def validate(self):
         self.buttons.button(QDialogButtonBox.StandardButton.Ok).setEnabled(bool(
-            self.task_id.text().strip() and self.title.text().strip() and self.spec.toPlainText().strip()))
+            self.spec.toPlainText().strip()))
 
     def values(self):
         tests = json.loads(self.tests.toPlainText()) if self.tests.toPlainText().strip() else {}
         if not isinstance(tests, dict):
             raise ValueError("Cấu hình test của Owner phải là một đối tượng JSON")
         tests = {key: tuple(value) if isinstance(value, list) else value for key, value in tests.items()}
-        return dict(task_id=self.task_id.text().strip(), title=self.title.text().strip(), spec=self.spec.toPlainText(),
+        return dict(prompt=self.spec.toPlainText(),
             require_changes=self.require_changes.isChecked(), allow_spec_change=self.allow_spec_change.isChecked(),
             max_fix_cycles=self.fix_limit.value(), max_evidence_cycles=self.evidence_limit.value(), tests=tests)
 
 
 class TaskWindow(QMainWindow):
-    def __init__(self, root, project_id, parent=None, *, controller_factory=None):
+    task_created = Signal(str)
+
+    def __init__(self, root, project_id, parent=None, *, controller_factory=None, worker_service_factory=None, auto_discover=None):
         super().__init__(parent)
         self.root, self.project_id = root, project_id
         self.approvals = CommandApprovalBridge(self, self.valid_approval)
@@ -82,25 +89,61 @@ class TaskWindow(QMainWindow):
         self.pool = QThreadPool(self)
         self.pool.setMaxThreadCount(1)
         self.busy, self._job, self.running_task_id = False, None, None
+        self._callback = None
+        self.task_created.connect(self.created)
         content = QWidget()
         layout = QVBoxLayout(content)
-        self.new_button = QPushButton("+ Tạo công việc")
+        with ProjectRegistry(root) as registry:
+            project = registry.get(project_id)
+        self.heading = QLabel(project.project_name)
+        layout.addWidget(self.heading)
+        self.connections = QLabel()
+        layout.addWidget(self.connections)
+        self.worker_card = ProjectWorkerCard(root, lambda: self.project_id,
+            lambda work, callback: self.start_job(work, callback=callback), self,
+            service_factory=worker_service_factory, auto_discover=(controller_factory is None or worker_service_factory is not None)
+            if auto_discover is None else auto_discover)
+        layout.addWidget(self.worker_card)
+        layout.addWidget(QLabel("Bạn muốn Codex làm gì?"))
+        self.prompt = QTextEdit()
+        self.prompt.setPlaceholderText("Nhập yêu cầu của bạn…")
+        self.prompt.setMaximumHeight(150)
+        layout.addWidget(self.prompt)
+        self.send_button = QPushButton("Gửi yêu cầu")
+        self.send_button.clicked.connect(self.submit_prompt)
+        self.prompt.textChanged.connect(self.show_task)
+        layout.addWidget(self.send_button)
+        self.new_button = QPushButton("Tuỳ chọn yêu cầu nâng cao")
         self.new_button.clicked.connect(self.new_task)
-        layout.addWidget(self.new_button)
         body = QHBoxLayout()
         self.tasks = QListWidget()
         self.tasks.setMaximumWidth(260)
         self.tasks.currentItemChanged.connect(self.show_task)
         workers = QVBoxLayout()
-        workers.addWidget(QLabel("Codex Worker — dự án hiện tại"))
+        workers.addWidget(QLabel("Lịch sử công việc"))
         workers.addWidget(self.tasks)
         body.addLayout(workers)
         detail = QVBoxLayout()
+        self.owner_summary = QLabel("Nhập yêu cầu để bắt đầu")
+        self.owner_summary.setTextFormat(Qt.TextFormat.PlainText)
+        self.owner_summary.setWordWrap(True)
+        detail.addWidget(self.owner_summary)
+        self.diagnostics_button = QPushButton("Chi tiết kỹ thuật")
+        self.diagnostics_button.setCheckable(True)
+        self.diagnostics = QWidget()
+        diagnostic_layout = QVBoxLayout(self.diagnostics)
+        self.diagnostics.hide()
+        self.diagnostics_button.toggled.connect(self.diagnostics.setVisible)
+        diagnostic_layout.addWidget(self.new_button)
+        self.project_identity = QLabel()
+        self.project_identity.setTextFormat(Qt.TextFormat.PlainText)
+        self.project_identity.setWordWrap(True)
+        diagnostic_layout.addWidget(self.project_identity)
         self.summary = QLabel("Chọn một công việc")
         self.summary.setTextFormat(Qt.TextFormat.PlainText)
         self.summary.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         self.summary.setWordWrap(True)
-        detail.addWidget(self.summary)
+        diagnostic_layout.addWidget(self.summary)
         self.spec = QTextEdit()
         self.spec.setReadOnly(True)
         self.spec.setMaximumHeight(160)
@@ -111,7 +154,10 @@ class TaskWindow(QMainWindow):
         for button, callback in ((self.start_button, lambda: self.start(False)), (self.pause_button, self.pause),
             (self.resume_button, lambda: self.start(True)), (self.stop_button, self.stop), (self.owner_button, self.owner_decision)):
             button.clicked.connect(callback)
-            controls.addWidget(button)
+            if button is self.start_button:
+                diagnostic_layout.addWidget(button)
+            else:
+                controls.addWidget(button)
         detail.addLayout(controls)
         worker_controls = QHBoxLayout()
         self.open_worker_button, self.pause_auto_button, self.manual_button, self.resume_auto_button = (
@@ -130,14 +176,26 @@ class TaskWindow(QMainWindow):
         self.worker_identity.setTextFormat(Qt.TextFormat.PlainText)
         self.worker_identity.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         self.worker_identity.setWordWrap(True)
-        detail.addWidget(self.worker_identity)
+        diagnostic_layout.addWidget(self.worker_identity)
         self.timeline = QTextEdit()
         self.timeline.setReadOnly(True)
-        detail.addWidget(QLabel("Nhật ký hoạt động"))
-        detail.addWidget(self.timeline)
+        self.diagnostic_error = QLabel()
+        self.diagnostic_error.setTextFormat(Qt.TextFormat.PlainText)
+        self.diagnostic_error.setWordWrap(True)
+        diagnostic_layout.addWidget(self.diagnostic_error)
+        diagnostic_layout.addWidget(QLabel("Nhật ký hoạt động"))
+        diagnostic_layout.addWidget(self.timeline)
+        detail.addWidget(self.diagnostics_button)
+        self.diagnostic_scroll = QScrollArea()
+        self.diagnostic_scroll.setWidgetResizable(True)
+        self.diagnostic_scroll.setMaximumHeight(300)
+        self.diagnostic_scroll.setWidget(self.diagnostics)
+        self.diagnostic_scroll.hide()
+        self.diagnostics_button.toggled.connect(self.diagnostic_scroll.setVisible)
+        detail.addWidget(self.diagnostic_scroll)
         body.addLayout(detail, 1)
         layout.addLayout(body)
-        self.message = QLabel("Bắt đầu chạy công việc tự động. Tạm dừng chờ điểm dừng an toàn; Dừng yêu cầu ngắt công việc. PASS nghĩa là sẵn sàng để Owner duyệt.")
+        self.message = QLabel("Gửi yêu cầu để Codex làm việc và ChatGPT review tự động.")
         self.message.setTextFormat(Qt.TextFormat.PlainText)
         self.message.setWordWrap(True)
         layout.addWidget(self.message)
@@ -166,7 +224,9 @@ class TaskWindow(QMainWindow):
         self.tasks.blockSignals(True)
         self.tasks.clear()
         for task in tasks:
-            item = QListWidgetItem(f"{task.task_id} — {state_text(views[task.task_id].status)}")
+            group = "Hoàn tất" if task.state is S.COMPLETE else "Lỗi" if task.state is S.PAUSED_ERROR else "Đã dừng" if task.state is S.STOPPED else "Đang làm"
+            status = state_text(views[task.task_id].status)
+            item = QListWidgetItem(f"{group}{' · ' + status if status != group else ''}\n{task.title}")
             item.setData(Qt.ItemDataRole.UserRole, task.task_id)
             self.tasks.addItem(item)
             if task.task_id == selected:
@@ -178,6 +238,21 @@ class TaskWindow(QMainWindow):
 
     def show_task(self, *_):
         self.new_button.setEnabled(not self.busy)
+        with ProjectRegistry(self.root) as registry:
+            project = registry.get(self.project_id)
+            try:
+                registry.state.assert_project_available(self.project_id)
+                available = True
+            except Exception:
+                available = False
+        self.worker_card.refresh(busy=self.busy)
+        self.project_identity.setText(f"PROJECT_ID={self.project_id}\nPROJECT_WORKER_THREAD_ID={project.codex_worker_thread_id or 'NONE'}\n"
+            f"PROJECT_WORKER_REPOSITORY={project.codex_worker_repo_path or 'NONE'}\n"
+            f"PROJECT_WORKER_VERIFIED_AT={project.codex_worker_verified_at or 'NONE'}")
+        self.connections.setText(f"Worker Codex: {'Đã kết nối' if self.worker_card.connected == self.project_id else 'Cần kiểm tra'}   "
+            f"ChatGPT Reviewer: {state_text(project.chatgpt_status)}   GitHub: {state_text(project.github_status)}")
+        self.send_button.setEnabled(bool(not self.busy and available and self.prompt.toPlainText().strip()
+                                        and project.codex_worker_thread_id))
         task = None
         if self.task_id:
             with ControllerStore(self.root) as store:
@@ -191,6 +266,10 @@ class TaskWindow(QMainWindow):
                 f"WORKER_THREAD_ID={identity.worker_thread_id or 'Chưa bắt đầu'}\nREPOSITORY={identity.repository}\n"
                 f"TASK_BRANCH={identity.task_branch}\nTrạng thái Worker: {state_text(view.status)}")
             counters = task.counters
+            status = "Hoàn tất — sẵn sàng để bạn duyệt" if task.ready_for_owner_review else (
+                "Codex đang sửa theo review" if task.state is S.WORKER_RUNNING and task.pending.get("worker_kind") == "WORKER_FIX"
+                else "Có lỗi cần xử lý" if task.state is S.PAUSED_ERROR else state_text(task.state))
+            self.owner_summary.setText(f"{task.title}\n● {status}")
             self.summary.setText(f"Công việc: {task.task_id} — {task.title}\nTrạng thái: {state_text(task.state)}\nĐặc tả: {task_spec_path(task.task_id)}\n"
                 f"Nhánh: {task_branch_name(task.task_id)}\nBase SHA: {task.base_sha or 'Chưa commit'}\nCandidate SHA: {task.candidate_sha or 'Không có'}\n"
                 f"Remote SHA: {publication['github_last_remote_sha'] if publication else 'Không có'}\n"
@@ -203,6 +282,7 @@ class TaskWindow(QMainWindow):
             self.spec.setPlainText(task.spec)
             self.timeline.setPlainText("\n".join(f"{e['created_at']} {e['kind']} {e['payload_json']}" for e in events[-1000:]))
         else:
+            self.owner_summary.setText("Nhập yêu cầu để bắt đầu")
             self.summary.setText("Chưa có công việc. Tạo công việc để lưu đặc tả gốc thành commit.")
             self.spec.clear()
             self.timeline.clear()
@@ -272,7 +352,7 @@ class TaskWindow(QMainWindow):
         instruction = None
         if action is RecoveryAction.CONTINUE_WORKER:
             instruction, accepted = owner_input(self, recovery_text(action),
-                f"Chỉ dẫn cho {identity.task_id}, giữ nguyên Codex thread {identity.worker_thread_id}.")
+                "Chỉ dẫn bổ sung cho công việc đang chọn, dùng đúng Worker hiện tại.")
             if not accepted:
                 return
         def work():
@@ -303,9 +383,9 @@ class TaskWindow(QMainWindow):
         controller = self.factory()
         try:
             view = controller.open_worker(self.task_id)
-            self.message.setText(f"Đã mở Worker {view.identity.task_id}: {view.identity.worker_thread_id or 'Chưa bắt đầu'}. Xem hoạt động bên dưới.")
+            self.message.setText("Đã chọn Worker của công việc này. Danh tính đầy đủ nằm trong Chi tiết kỹ thuật.")
         except Exception as exc:
-            self.message.setText(f"{getattr(exc, 'code', 'WORKER_SELECTION_FAILED')}: {exc}")
+            self.show_error(exc)
         finally:
             controller.close()
         self.show_task()
@@ -315,9 +395,9 @@ class TaskWindow(QMainWindow):
         controller = self.factory()
         try:
             view = controller.request_worker_pause(identity)
-            self.message.setText(f"{identity.task_id}: {state_text(view.status)}")
+            self.message.setText(state_text(view.status))
         except Exception as exc:
-            self.message.setText(f"{getattr(exc, 'code', 'OWNER_STEER_NOT_SAFE')}: {exc}")
+            self.show_error(exc)
         finally:
             controller.close()
         self.refresh()
@@ -325,7 +405,7 @@ class TaskWindow(QMainWindow):
     def manual_instruction(self):
         identity = self.selected_worker()  # Capture selection before the dialog/job.
         text, accepted = owner_input(self, "Gửi chỉ dẫn thủ công",
-            f"Chỉ dẫn của Owner cho {identity.task_id}, đúng thread {identity.worker_thread_id}. Tự động vẫn tạm dừng.")
+            "Chỉ dẫn cho công việc đang chọn. Worker được giữ nguyên; tự động vẫn tạm dừng.")
         if not accepted:
             return
         def work():
@@ -347,10 +427,11 @@ class TaskWindow(QMainWindow):
                 controller.close()
         self.start_job(work, identity.task_id)
 
-    def start_job(self, work, task_id=None):
+    def start_job(self, work, task_id=None, *, callback=None):
         if self.busy:
             return False
         self.busy, self.running_task_id = True, task_id
+        self._callback = callback
         self._job = Job(work)
         self._job.signals.finished.connect(self.finished)
         self.pool.start(self._job)
@@ -358,10 +439,42 @@ class TaskWindow(QMainWindow):
         return True
 
     def finished(self, result, error):
+        callback, self._callback = self._callback, None
         self.busy, self._job, self.running_task_id = False, None, None
-        self.message.setText(f"{getattr(error, 'code', 'TASK_SETUP_FAILED')}: {error}" if error else
-            f"Trạng thái công việc: {state_text(getattr(result, 'state', 'Đã cập nhật'))}. {getattr(result, 'error_code', None) or ''}")
+        if error:
+            self.show_error(error)
+        else:
+            self.message.setText(f"Trạng thái công việc: {state_text(getattr(result, 'state', 'Đã cập nhật'))}.")
         self.refresh()
+        if callback:
+            callback(result, error)
+
+    def show_error(self, error):
+        self.diagnostic_error.setText(f"{getattr(error, 'code', 'TASK_SETUP_FAILED')}: {error}")
+        self.message.setText("Có lỗi cần xử lý. Xem Chi tiết kỹ thuật để biết nguyên nhân.")
+
+    @Slot(str)
+    def created(self, task_id):
+        self.running_task_id = task_id
+        self.refresh()
+        for index in range(self.tasks.count()):
+            if self.tasks.item(index).data(Qt.ItemDataRole.UserRole) == task_id:
+                self.tasks.setCurrentRow(index)
+                break
+
+    def submit_prompt(self):
+        if not self.send_button.isEnabled():
+            return
+        self.submit_values(dict(prompt=self.prompt.toPlainText()))
+
+    def submit_values(self, values):
+        def work():
+            controller = self.factory()
+            try:
+                return asyncio.run(controller.submit_request(**values, on_created=self.task_created.emit))
+            finally:
+                controller.close()
+        self.start_job(work)
 
     def new_task(self):
         dialog = NewTaskDialog(self)
@@ -370,15 +483,9 @@ class TaskWindow(QMainWindow):
         try:
             values = dialog.values()
         except (ValueError, TypeError) as exc:
-            self.message.setText("TASK_CONFIGURATION_INVALID: " + str(exc))
+            self.show_error(exc)
             return
-        def work():
-            controller = self.factory()
-            try:
-                return asyncio.run(controller.create_task(**values))
-            finally:
-                controller.close()
-        self.start_job(work)
+        self.submit_values(values)
 
     def start(self, resume=False):
         task_id = self.task_id

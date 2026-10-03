@@ -416,6 +416,10 @@ def test_schema3_upgrade_preserves_task_rows_and_rolls_back_on_failure(setup, mo
     root, _, _, _, _, _, _ = setup
     with StateStore(root) as state:
         before = state.get("p", "task")
+        for trigger in ("worker_owner_insert", "worker_owner_update"):
+            state._connection.execute("DROP TRIGGER " + trigger)
+        state._connection.execute("DROP TABLE worker_owners")
+        state._connection.execute("CREATE UNIQUE INDEX worker_thread_identity ON tasks(worker_thread_id) WHERE worker_thread_id IS NOT NULL")
         for table in ("github_publications", "github_events", "github_reviews", "projects", "project_events", "controller_tasks", "controller_effects", "controller_reviews", "controller_events"):
             state._connection.execute(f"DROP TABLE {table}")
         state._connection.execute("PRAGMA user_version=3")
@@ -433,7 +437,7 @@ def test_schema3_upgrade_preserves_task_rows_and_rolls_back_on_failure(setup, mo
         assert not db.execute("SELECT name FROM sqlite_master WHERE name='github_publications'").fetchall()
     with StateStore(root) as state:
         assert state.get("p", "task") == before
-        assert state._connection.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION == 6
+        assert state._connection.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION == 7
 
 
 def test_github_configuration_roundtrip_and_no_token_field():

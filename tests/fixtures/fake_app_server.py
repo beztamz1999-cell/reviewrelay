@@ -71,7 +71,8 @@ for line in sys.stdin:
             send({"id": request["id"], "error": {"code": -32000, "message": "No such thread"}})
             continue
         if method == "thread/start":
-            current_thread = {"id": "fixture-thread", "cwd": params["cwd"], "turns": []}
+            current_thread = {"id": "fixture-thread", "cwd": params["cwd"], "turns": [],
+                "source": "appServer", "ephemeral": False, "name": "Fixture worker", "updatedAt": 1, "status": {"type": "idle"}}
             save(current_thread)
         else:
             current_thread = json.loads(state_path.read_text(encoding="utf-8"))
@@ -136,6 +137,8 @@ for line in sys.stdin:
         complete("interrupted")
     elif method == "thread/read":
         result(request, {"thread": json.loads(state_path.read_text(encoding="utf-8"))})
+    elif method == "thread/list":
+        result(request, {"data": [json.loads(state_path.read_text(encoding="utf-8"))] if state_path.exists() else [], "nextCursor": None})
     elif request.get("id") == "request-approval" and "result" in request:
         complete("completed" if request["result"]["decision"] == "accept" else "interrupted")
 if mode == "hang-close":

@@ -57,9 +57,11 @@ class Harness:
         self.evidence_fault = None
         self.pause_after_completion = False
         self.worker_gate = None
+        self.resume_gate = self.resume_entered = None
         self.workers = []
         self.notifications = []
         self.thread_ids = []
+        self.thread_starts = 0
         self.publisher_events = []
         self.pr_creates = 0
         self.controller = None
@@ -74,6 +76,7 @@ class Harness:
                 harness.workers.append(self)
 
             async def start_task(self, prompt):
+                harness.thread_starts += 1
                 harness.initial += 1
                 assert "do not push GitHub" in prompt and "implementation/audit reports" in prompt
                 assert task_spec_path(self.task.task_id) in prompt
@@ -84,6 +87,9 @@ class Harness:
                 self.manual = prompt.startswith("ReviewRelay Owner manual instruction")
                 if self.manual:
                     harness.manuals.append((self.task.task_id, prompt))
+                elif "INITIAL TASK INSTRUCTION:" in prompt:
+                    harness.initial += 1
+                    assert task_spec_path(self.task.task_id) in prompt and "do not push GitHub" in prompt
                 elif "after a proven completed turn" in prompt:
                     harness.continuations += 1
                 else:
@@ -133,6 +139,9 @@ class Harness:
                 return self.thread
 
             async def resume_task(self):
+                if harness.resume_gate:
+                    harness.resume_entered.set()
+                    await harness.resume_gate.wait()
                 with StateStore(harness.root) as state:
                     self.thread = state.get(self.task.project_id, self.task.task_id).worker_thread_id
                 return self.thread
@@ -281,7 +290,10 @@ def h(tmp_path, git_repo):
             github_repo_url="https://github.com/owner/project", github_git_url=str(remote), github_owner="owner", github_repo_name="project",
             github_default_branch="main", github_last_verified_at="offline-fixture", github_visibility="PRIVATE",
             chatgpt_conversation_url="https://chatgpt.com/c/offline-controller", chatgpt_status=Status.READY,
-            worker_settings={"executable": "fixture.exe"}, codex_status=Status.READY))
+            worker_settings={"executable": "fixture.exe"}, codex_status=Status.READY,
+            codex_worker_thread_id="thread-TASK-1", codex_worker_repo_path=str(git_repo),
+            codex_worker_title="Harmless worker", codex_worker_source="appServer", codex_worker_verified_at="offline-fixture"),
+            event="PROJECT_WORKER_BOUND")
     return Harness(root, git_repo, remote, project)
 
 
@@ -781,6 +793,10 @@ def test_schema5_to6_retains_project_worker_bridge_rows_and_rolls_back_atomicall
             (h.project.project_id, task.task_id, task.base_sha))
         for table in ("controller_tasks", "controller_effects", "controller_reviews", "controller_events"):
             state._connection.execute("DROP TABLE " + table)
+        for trigger in ("worker_owner_insert", "worker_owner_update"):
+            state._connection.execute("DROP TRIGGER " + trigger)
+        state._connection.execute("DROP TABLE worker_owners")
+        state._connection.execute("CREATE UNIQUE INDEX worker_thread_identity ON tasks(worker_thread_id) WHERE worker_thread_id IS NOT NULL")
         state._connection.execute("PRAGMA user_version=5")
         state._connection.commit()
     c.close()
@@ -800,10 +816,10 @@ def test_schema5_to6_retains_project_worker_bridge_rows_and_rolls_back_atomicall
         assert tuple(state._connection.execute("SELECT * FROM projects").fetchone()) == before_project
         assert tuple(state._connection.execute("SELECT * FROM github_publications").fetchone()) == before_pub
         assert state._connection.execute("SELECT raw_text FROM github_reviews").fetchone()[0] == "saved raw"
-        assert state._connection.execute("PRAGMA user_version").fetchone()[0] == 6
+        assert state._connection.execute("PRAGMA user_version").fetchone()[0] == 7
 
 
-def test_unrelated_tasks_have_distinct_threads_and_branches(h):
+def test_sequential_project_jobs_share_worker_and_keep_distinct_task_branches(h):
     first, task = h.create(task="TASK-1")
     a = run(first.run(task.task_id))
     first.close()
@@ -811,7 +827,8 @@ def test_unrelated_tasks_have_distinct_threads_and_branches(h):
     second, task = h.create(task="TASK-2")
     b = run(second.run(task.task_id))
     assert a.state is b.state is S.COMPLETE, b.error_code
-    assert a.worker_thread_id != b.worker_thread_id
+    assert a.worker_thread_id == b.worker_thread_id
+    assert h.thread_starts == 0
     assert a.published["branch"] != b.published["branch"]
     assert git(h.remote, "rev-parse", "refs/heads/" + a.published["branch"]) == a.candidate_sha
     assert git(h.remote, "rev-parse", "refs/heads/" + b.published["branch"]) == b.candidate_sha

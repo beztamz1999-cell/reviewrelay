@@ -242,7 +242,7 @@ def test_private_create_exact_initial_push_and_local_end_to_end_project_task_smo
     run(service.connect_reviewer(project.project_id, url))
     ready = run(service.connect_codex(project.project_id, executable=sys.executable, model="configured", reasoning_effort="low"))
     assert ready.ready and ready.status == "PROJECT_READY" and [p[0] for p in probes] == ["auth", "reviewer", "runtime"]
-    assert "thread" not in json.dumps(asdict(ready)).lower()
+    assert ready.codex_worker_thread_id is None  # Runtime setup never creates or guesses a worker.
     config = ready.to_config()
     head = commit_change(repo, task_spec_path(task), "# Shared task\nImplement task result.\n")
     begin_task(config, task, root)
@@ -623,18 +623,22 @@ def test_phase5_and_bridge_migration_preserves_tasks_and_publish_review_rows(set
     root, repo, _, _, _, _, _ = setup
     from reviewrelay.config import ProjectConfig, RepoConfig
     old = replace(begin_task(ProjectConfig("legacy", RepoConfig(str(repo))), "task", root),
-        worker_thread_id="kept-thread", worker_repo_path=str(repo), worker_last_turn_status="COMPLETED")
+        worker_thread_id="kept-thread", worker_session_identity="kept-thread", worker_repo_path=str(repo), worker_last_turn_status="COMPLETED")
     with StateStore(root) as state:
         state.save(old)
         # A real Phase 5 schema has worker state but none of the later tables.
         db = state._connection
+        for name in ("worker_owner_insert", "worker_owner_update"):
+            db.execute("DROP TRIGGER " + name)
+        db.execute("DROP TABLE worker_owners")
+        db.execute("CREATE UNIQUE INDEX worker_thread_identity ON tasks(worker_thread_id) WHERE worker_thread_id IS NOT NULL")
         for name in ("projects", "project_events", "github_publications", "github_events", "github_reviews", "controller_tasks", "controller_effects", "controller_reviews", "controller_events"):
             db.execute("DROP TABLE " + name)
         db.execute("PRAGMA user_version=3")
         db.commit()
     with StateStore(root) as state:
         assert state.get("legacy", "task") == old
-        assert state._connection.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION == 6
+        assert state._connection.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION == 7
         state._connection.execute("INSERT INTO github_events(project_id,task_id,kind,payload_json,created_at) VALUES('legacy','task','saved','{}','now')")
         state._connection.execute("INSERT INTO github_publications VALUES('legacy','task','origin','main','reviewrelay/task',NULL,NULL,?,?, 'READY_TO_NOTIFY_REVIEWER','now','{}')", (old.base_sha, old.base_sha))
         state._connection.execute("INSERT INTO github_reviews VALUES('kept-review','legacy','task',?,1,'VALIDATED','{}','owned raw response','{}','now')", (old.base_sha,))
@@ -642,6 +646,10 @@ def test_phase5_and_bridge_migration_preserves_tasks_and_publish_review_rows(set
             state._connection.execute("DROP TABLE " + table)
         state._connection.execute("DROP TABLE projects")
         state._connection.execute("DROP TABLE project_events")
+        for name in ("worker_owner_insert", "worker_owner_update"):
+            state._connection.execute("DROP TRIGGER " + name)
+        state._connection.execute("DROP TABLE worker_owners")
+        state._connection.execute("CREATE UNIQUE INDEX worker_thread_identity ON tasks(worker_thread_id) WHERE worker_thread_id IS NOT NULL")
         state._connection.execute("PRAGMA user_version=4")
         state._connection.commit()
     original = StateStore._project_tables

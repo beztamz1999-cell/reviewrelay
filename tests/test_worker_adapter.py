@@ -358,7 +358,7 @@ def test_task_repo_binding_rejects_cwd_drift(worker_setup):
     asyncio.run(run())
 
 
-def test_sqlite_rejects_thread_bound_to_another_task(worker_setup):
+def test_sqlite_allows_historical_same_project_thread_but_rejects_cross_project(worker_setup):
     root, config, _, make = worker_setup
 
     async def run():
@@ -370,8 +370,10 @@ def test_sqlite_rejects_thread_bound_to_another_task(worker_setup):
     asyncio.run(run())
     with StateStore(root) as state:
         record = state.get(config.project_id, "task")
+        state.save(replace(record, task_id="another-task"))
+        assert state.get(config.project_id, "another-task").worker_thread_id == record.worker_thread_id
         with pytest.raises(sqlite3.IntegrityError):
-            state.save(replace(record, task_id="another-task"))
+            state.save(replace(record, project_id="another-project", task_id="another-task"))
 
 
 @pytest.mark.parametrize("mode", ["events-before-response", "foreign-events"])
@@ -410,7 +412,9 @@ def test_v2_migration_preserves_existing_state_and_worker_fields_reload(tmp_path
     with StateStore(root) as state:
         state.save(old)
     connection = sqlite3.connect(root.safe_path("db/relay.db"))
-    connection.execute("DROP INDEX worker_thread_identity")
+    connection.execute("DROP TRIGGER worker_owner_insert")
+    connection.execute("DROP TRIGGER worker_owner_update")
+    connection.execute("DROP TABLE worker_owners")
     for table in ("github_publications", "github_events", "github_reviews", "projects", "project_events", "controller_tasks", "controller_effects", "controller_reviews", "controller_events"):
         connection.execute(f"DROP TABLE {table}")
     for column in ("worker_thread_id", "worker_repo_path", "worker_last_turn_id", "worker_last_turn_status", "worker_last_event_at"):
@@ -420,7 +424,7 @@ def test_v2_migration_preserves_existing_state_and_worker_fields_reload(tmp_path
     connection.close()
     with StateStore(root) as state:
         assert state.get("project", "old-task") == old
-        assert state._connection.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION == 6
+        assert state._connection.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION == 7
         worker = replace(old, worker_thread_id="thread", worker_repo_path="repo", worker_last_turn_id="turn",
                          worker_last_turn_status="COMPLETED", worker_last_event_at="timestamp")
         state.save(worker)

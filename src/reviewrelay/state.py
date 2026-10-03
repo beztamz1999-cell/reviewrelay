@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import sqlite3
+import json
+import os
 from pathlib import Path
 
 from .errors import SchemaVersionError, StorageError
@@ -11,7 +13,7 @@ from .models import TaskRecord, TaskState, utc_now_iso
 from .storage import PortableDataRoot
 
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 
 
 class StateStore:
@@ -44,7 +46,7 @@ class StateStore:
             self._migrate_v3_to_v4()
         elif version == 4:
             pass
-        elif version == 5:
+        elif version in {5, 6}:
             pass
         elif version != SCHEMA_VERSION:
             self._connection.close()
@@ -53,6 +55,8 @@ class StateStore:
             self._migrate_v4_to_v5()
         if version in {1, 2, 3, 4, 5}:
             self._migrate_v5_to_v6()
+        if version in {1, 2, 3, 4, 5, 6}:
+            self._migrate_v6_to_v7()
 
     def _create_current_schema(self) -> None:
         allowed_states = ", ".join(f"'{state.value}'" for state in TaskState)
@@ -84,11 +88,86 @@ class StateStore:
                     PRIMARY KEY (project_id, task_id)
                 )
             """)
-            self._connection.execute("CREATE UNIQUE INDEX worker_thread_identity ON tasks(worker_thread_id) WHERE worker_thread_id IS NOT NULL")
             self._connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
             self._github_tables()
             self._project_tables()
             self._controller_tables()
+            self._worker_tables()
+
+    def _worker_tables(self):
+        # Ownership remains reserved even when the Project changes its canonical worker.
+        self._connection.execute("CREATE TABLE worker_owners (thread_id TEXT PRIMARY KEY, project_id TEXT NOT NULL)")
+        for operation in ("INSERT", "UPDATE OF worker_thread_id,project_id"):
+            name = "worker_owner_insert" if operation == "INSERT" else "worker_owner_update"
+            self._connection.execute(f"""CREATE TRIGGER {name} BEFORE {operation} ON tasks
+                WHEN NEW.worker_thread_id IS NOT NULL BEGIN
+                SELECT RAISE(ABORT,'Worker belongs to another Project') WHERE EXISTS
+                  (SELECT 1 FROM worker_owners WHERE thread_id=NEW.worker_thread_id AND project_id!=NEW.project_id);
+                INSERT INTO worker_owners SELECT NEW.worker_thread_id,NEW.project_id WHERE NOT EXISTS
+                  (SELECT 1 FROM worker_owners WHERE thread_id=NEW.worker_thread_id);
+                END""")
+
+    def _migrate_v6_to_v7(self):
+        """Validate history before relaxing Task uniqueness; never guess a worker."""
+        try:
+            with self._connection as db:
+                db.execute("BEGIN IMMEDIATE")
+                rows = db.execute("SELECT * FROM tasks WHERE worker_thread_id IS NOT NULL").fetchall()
+                owners, repositories = {}, {}
+                for row in rows:
+                    thread, project = row["worker_thread_id"], row["project_id"]
+                    repo = row["worker_repo_path"]
+                    if (not repo or row["worker_session_identity"] != thread
+                            or owners.get(thread, project) != project):
+                        raise SchemaVersionError("Inconsistent historical worker identity; migration refused")
+                    identity = os.path.normcase(str(Path(repo).resolve()))
+                    if repositories.get(project, identity) != identity:
+                        raise SchemaVersionError("Historical Project repositories differ; migration refused")
+                    registered = db.execute("SELECT local_identity FROM projects WHERE project_id=?", (project,)).fetchone()
+                    if registered and registered[0] != identity:
+                        raise SchemaVersionError("Historical worker repository differs from Project")
+                    owners[thread], repositories[project] = project, identity
+                active = {}
+                for row in db.execute("SELECT * FROM controller_tasks"):
+                    record = json.loads(row["record_json"])
+                    task = db.execute("SELECT worker_thread_id FROM tasks WHERE project_id=? AND task_id=?",
+                                      (row["project_id"], row["task_id"])).fetchone()
+                    if record.get("worker_thread_id") and (not task or task[0] != record["worker_thread_id"]):
+                        raise SchemaVersionError("Controller worker history differs; migration refused")
+                    if record["state"] not in {"COMPLETE", "STOPPED"}:
+                        if row["project_id"] in active:
+                            raise SchemaVersionError("Multiple unfinished jobs in one Project; migration refused")
+                        active[row["project_id"]] = row["task_id"]
+                db.execute("DROP INDEX worker_thread_identity")
+                self._worker_tables()
+                db.executemany("INSERT INTO worker_owners VALUES(?,?)", owners.items())
+                db.execute("PRAGMA user_version=7")
+        except Exception:
+            self._connection.close()
+            raise
+
+    def assert_project_available(self, project_id, task_id=None):
+        """Paused jobs and ambiguous terminal effects retain exclusive ownership."""
+        for row in self._connection.execute("SELECT task_id,record_json FROM controller_tasks WHERE project_id=?", (project_id,)):
+            if row["task_id"] == task_id:
+                continue
+            task = json.loads(row["record_json"])
+            if task["state"] not in {"COMPLETE", "STOPPED"}:
+                raise StorageError("Finish or resolve the existing Project job first", code="PROJECT_JOB_ACTIVE")
+            for effect in self._connection.execute("SELECT * FROM controller_effects WHERE project_id=? AND task_id=? "
+                    "AND status NOT IN ('PLANNED','COMPLETED')", (project_id, row["task_id"])):
+                proof = json.loads(effect["payload_json"])
+                record = self.get(project_id, row["task_id"])
+                if (effect["status"] != "RECONCILED_TERMINAL" or effect["kind"] != "WORKER_CONTINUATION"
+                        or proof.get("proof_source") != "thread/read" or not record
+                        or proof.get("thread_id") != record.worker_thread_id or not proof.get("turn_id")
+                        or proof.get("terminal_status") not in {"INTERRUPTED", "FAILED"}
+                        or (proof["turn_id"] == record.worker_last_turn_id and proof["terminal_status"] != record.worker_last_turn_status)):
+                    raise StorageError("Existing Project effect is unresolved", code="PROJECT_JOB_ACTIVE")
+        if self._connection.execute("SELECT 1 FROM tasks WHERE project_id=? AND task_id!=? AND worker_thread_id IS NOT NULL "
+                "AND worker_last_turn_status IS NOT NULL AND worker_last_turn_status NOT IN ('THREAD_CREATED','COMPLETED','FAILED','INTERRUPTED') LIMIT 1",
+                (project_id, task_id or "")).fetchone():
+            raise StorageError("Existing worker turn is unresolved", code="PROJECT_JOB_ACTIVE")
 
     def _migrate_v1_to_v2(self) -> None:
         """Add the two Phase 2 counters without rewriting Phase 1 task state."""
@@ -184,6 +263,10 @@ class StateStore:
             raise StorageError("worker_reported_sha_mismatch must be a boolean")
         updated_at = record.updated_at or utc_now_iso()
         with self._connection:
+            if not self._connection.in_transaction:
+                self._connection.execute("BEGIN IMMEDIATE")
+            if record.worker_last_turn_status in {"THREAD_STARTING", "STARTING", "IN_PROGRESS"}:
+                self.assert_project_available(record.project_id, record.task_id)
             self._connection.execute("""
                 INSERT INTO tasks (
                     project_id, task_id, task_state, base_sha, candidate_sha,

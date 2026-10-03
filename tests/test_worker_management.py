@@ -32,7 +32,7 @@ def test_two_tasks_selection_targets_exact_thread_repo_branch_without_new_thread
     h.actions = ["PASS"]
     b = run(c.run(b.task_id))
     ib = c.open_worker(b.task_id).identity
-    assert ia.worker_thread_id != ib.worker_thread_id
+    assert ia.worker_thread_id == ib.worker_thread_id
     assert {v.identity.task_id for v in c.workers()} == {a.task_id, b.task_id}
     h.manual_no_commit = True
     for task, identity in ((a, ia), (b, ib)):
@@ -167,9 +167,11 @@ def test_pause_during_unresolved_worker_turn_does_not_interrupt_or_compete(h):
         h.worker_gate = asyncio.Event()
         running = asyncio.create_task(c.run(task.task_id))
         for _ in range(300):
-            if c.store.get(h.project.project_id, task.task_id).worker_thread_id:
+            record = c.store.state.get(h.project.project_id, task.task_id)
+            if record.worker_last_turn_id and record.worker_last_turn_status == "IN_PROGRESS":
                 break
             await asyncio.sleep(.02)
+        assert record.worker_last_turn_status == "IN_PROGRESS"
         identity = c.open_worker(task.task_id).identity
         assert identity.worker_thread_id
         assert c.request_worker_pause(identity).status is WorkerStatus.PAUSE_PENDING
@@ -324,17 +326,17 @@ def test_manual_crash_recovery_never_repeats_turn_or_creates_thread(h, checkpoin
     c.close()
 
 
-def test_manual_pause_before_first_thread_does_not_create_replacement(h):
+def test_manual_pause_before_first_auto_turn_reuses_project_worker(h):
     c, task = h.create()
     identity = c.open_worker(task.task_id).identity
-    assert identity.worker_thread_id is None
+    assert identity.worker_thread_id == h.project.codex_worker_thread_id
     assert c.request_worker_pause(identity).status is WorkerStatus.PAUSED_OWNER_STEER
-    with pytest.raises(ControllerError):
-        run(c.send_manual_instruction(identity, "Do not create a thread"))
-    assert h.initial == 0 and not h.manuals
+    h.manual_no_commit = True
+    run(c.send_manual_instruction(identity, "Do not change files or create a thread"))
+    assert h.initial == 0 and len(h.manuals) == 1 and h.thread_starts == 0
     run(c.resume_auto_relay(identity))
     assert run(c.run(task.task_id)).state is S.COMPLETE
-    assert h.initial == 1
+    assert h.initial == 1 and h.thread_starts == 0
     c.close()
 
 
@@ -403,6 +405,7 @@ def test_controller_manual_steer_uses_real_adapter_public_thread_resume_without_
     c.request_worker_pause(identity)
     fake_state = h.root.safe_path("logs/manual-appserver.json")
     fake_state.write_text(json.dumps({"id": identity.worker_thread_id, "cwd": str(h.repo),
+        "source": "appServer", "ephemeral": False, "status": {"type": "idle"},
         "turns": [{"id": task.worker_turn_id, "status": "completed", "items": []}]}), encoding="utf-8")
     fixture = Path(__file__).parent / "fixtures" / "fake_app_server.py"
     settings = CodexWorkerSettings(timeouts=WorkerTimeouts(startup_seconds=5, initialize_seconds=5,

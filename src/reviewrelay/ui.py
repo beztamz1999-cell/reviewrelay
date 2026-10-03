@@ -246,9 +246,10 @@ class ReviewerDialog(QDialog):
 
 
 class ProjectHub(QMainWindow):
-    def __init__(self, root, *, service_factory=None):
+    def __init__(self, root, *, service_factory=None, worker_service_factory=None, auto_discover=True):
         super().__init__()
         self.root = root.create()
+        self.auto_discover = auto_discover
         self.service_factory = service_factory or (lambda: ProjectSetupService(root))
         self.setWindowTitle("ReviewRelay — Dự án")
         self.resize(1020, 640)
@@ -289,6 +290,11 @@ class ProjectHub(QMainWindow):
             label.setWordWrap(True)
             label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
             details.addWidget(label)
+        from .worker_ui import ProjectWorkerCard
+        self.worker_card = ProjectWorkerCard(root, lambda: self.project_id,
+            lambda work, callback: self.start_job("Kiểm tra Worker", work, callback), self,
+            service_factory=worker_service_factory, auto_discover=auto_discover)
+        details.addWidget(self.worker_card)
         self.initialize_button = QPushButton("Khởi tạo repository Git")
         self.snapshot_button = QPushButton("Xem trước commit Git ban đầu")
         self.github_button = QPushButton("Kết nối GitHub")
@@ -296,7 +302,7 @@ class ProjectHub(QMainWindow):
         self.codex_button = QPushButton("Kết nối Codex Worker")
         self.refresh_button = QPushButton("Kiểm tra repository local")
         self.unregister_button = QPushButton("Gỡ dự án khỏi ReviewRelay")
-        self.tasks_button = QPushButton("Công việc / + Tạo công việc")
+        self.tasks_button = QPushButton("Mở dự án — Gửi yêu cầu")
         for button, callback in ((self.initialize_button, self.initialize_git), (self.snapshot_button, self.preview_snapshot),
             (self.github_button, self.configure_github), (self.reviewer_button, self.configure_reviewer),
             (self.codex_button, self.configure_codex), (self.refresh_button, self.inspect_project), (self.unregister_button, self.unregister_project), (self.tasks_button, self.open_tasks)):
@@ -344,6 +350,7 @@ class ProjectHub(QMainWindow):
 
     def show_selected(self, *_):
         project = self.selected()
+        self.worker_card.refresh(busy=self.busy)
         for button in self.controls:
             button.setEnabled(not self.busy and (project is not None or button is self.create_button))
         self.projects.setEnabled(not self.busy)
@@ -524,7 +531,7 @@ class ProjectHub(QMainWindow):
                 window.raise_()
                 window.activateWindow()
                 return
-        window = TaskWindow(self.root, project.project_id, self)
+        window = TaskWindow(self.root, project.project_id, self, auto_discover=self.auto_discover)
         self.task_windows.append(window)
         window.show()
 

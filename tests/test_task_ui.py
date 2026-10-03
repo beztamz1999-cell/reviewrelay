@@ -42,10 +42,9 @@ def test_new_task_contract_defaults_and_explicit_test_registry(app):
     dialog = NewTaskDialog()
     ok = dialog.buttons.button(QDialogButtonBox.StandardButton.Ok)
     assert not ok.isEnabled()
-    dialog.task_id.setText("TASK-UI")
-    dialog.title.setText("Harmless task")
+    assert not hasattr(dialog, "task_id") and not hasattr(dialog, "title")
     dialog.spec.setPlainText("Create the requested harmless file.")
-    assert ok.isEnabled() and "Tạo công việc" in ok.text()
+    assert ok.isEnabled() and "Gửi yêu cầu" in ok.text()
     values = dialog.values()
     assert values["require_changes"] and not values["allow_spec_change"]
     assert values["max_fix_cycles"] == 3 and values["max_evidence_cycles"] == 5
@@ -67,20 +66,16 @@ def test_hub_task_controls_require_complete_project_readiness(app, h):
     hub.close()
 
 
-def test_new_task_ui_commits_spec_without_worker_then_start_runs_complete(window, h, app, monkeypatch):
+def test_new_task_ui_commits_spec_and_starts_in_one_action(window, h, app, monkeypatch):
     monkeypatch.setattr(NewTaskDialog, "exec", lambda self: QDialog.DialogCode.Accepted)
-    monkeypatch.setattr(NewTaskDialog, "values", lambda self: dict(task_id="TASK-UI", title="UI task",
-        spec="Create the harmless result file.\n"))
+    monkeypatch.setattr(NewTaskDialog, "values", lambda self: dict(prompt="Create the harmless result file.\n"))
     window.new_button.click()
     spin(app, lambda: not window.busy, timeout=120)
-    assert window.task_id == "TASK-UI" and h.initial == h.sends == 0, window.message.text()
+    assert window.task_id.startswith("job-") and h.initial == h.sends == 1, window.message.text()
     with ControllerStore(h.root) as store:
-        task = store.get(h.project.project_id, "TASK-UI")
-    assert task.state is S.READY and task.base_sha == git(h.repo, "rev-parse", "HEAD")
-    assert git(h.repo, "show", task.base_sha + ":.reviewrelay/tasks/TASK-UI.md") == task.spec.strip()
-    assert window.start_button.isEnabled() and not window.owner_button.isEnabled()
-    window.start_button.click()
-    spin(app, lambda: not window.busy, timeout=120)
+        task = store.get(h.project.project_id, window.task_id)
+    assert task.state is S.COMPLETE and task.candidate_sha == git(h.repo, "rev-parse", "HEAD")
+    assert git(h.repo, "show", task.base_sha + ":.reviewrelay/tasks/" + task.task_id + ".md") == task.spec.strip()
     assert "Trạng thái: Hoàn tất" in window.summary.text()
     assert "SẴN SÀNG ĐỂ OWNER DUYỆT: CÓ" in window.summary.text()
     for label in ("Base SHA:", "Candidate SHA:", "Remote SHA:", "Codex:", "GitHub:", "ChatGPT:", "Lượt kiểm chứng local:"):
@@ -186,13 +181,13 @@ def test_worker_panel_exact_identity_open_pause_manual_and_resume(window, h, app
     c.close()
     h.manual_no_commit = True
     window.refresh()
-    assert window.tasks.item(0).text() == task.task_id + " — Hoàn tất"
+    assert task.title in window.tasks.item(0).text() and task.task_id not in window.tasks.item(0).text()
     for field, value in (("PROJECT_ID", identity.project_id), ("TASK_ID", identity.task_id),
             ("WORKER_THREAD_ID", identity.worker_thread_id), ("REPOSITORY", identity.repository),
             ("TASK_BRANCH", identity.task_branch)):
         assert f"{field}={value}" in window.worker_identity.text()
     window.open_worker_button.click()
-    assert "Đã mở Worker" in window.message.text()
+    assert "Đã chọn Worker" in window.message.text()
     window.pause_auto_button.click()
     assert "Owner đang điều khiển" in window.tasks.item(0).text()
     assert window.manual_button.isEnabled() and window.resume_auto_button.isEnabled()
@@ -228,6 +223,8 @@ def test_worker_panel_project_scoping_and_selected_task_only(window, h, app, mon
         window.manual_button.click()
         spin(app, lambda: not window.busy, timeout=120)
         assert h.manuals[-1][0] == task.task_id
+        window.resume_auto_button.click()
+        spin(app, lambda: not window.busy, timeout=120)
     assert [t for t, _ in h.manuals] == [a.task_id, b.task_id]
     assert h.initial == h.sends == 2
 

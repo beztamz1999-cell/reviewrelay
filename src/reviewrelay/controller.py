@@ -7,6 +7,7 @@ import inspect
 import json
 from dataclasses import asdict, replace
 from pathlib import Path
+from uuid import uuid4
 
 from .config import ProjectConfig, ReviewConfig, validate_identifier
 from .controller_store import ControllerError, ControllerState as S, ControllerStore, ControllerTask
@@ -100,8 +101,12 @@ class TaskController(WorkerManagement):
                 raise ValueError("Cycle limits must be integers from 0 to 100")
         lock = self._project_lock()
         try:
+            self.store.state.assert_project_available(self.project_id)
             with ProjectRegistry(self.root) as registry:
-                config = registry.get(self.project_id).to_config()
+                project = registry.get(self.project_id)
+                config = project.to_config()
+            if not project.codex_worker_thread_id:
+                raise ControllerError("Connect a Project worker first", code="PROJECT_WORKER_REQUIRED")
             config = replace(config, review=ReviewConfig(max_fix_cycles, max_evidence_cycles), tests=tests or {})
             config = ProjectConfig.from_yaml(json.dumps(config.to_mapping()))  # JSON is valid YAML; validate Owner-configured argv.
             if self.store.state.get(self.project_id, task_id) or any(t.task_id == task_id for t in self.store.list(self.project_id)):
@@ -113,8 +118,10 @@ class TaskController(WorkerManagement):
             if not local.is_git or not local.clean or not local.head or not local.branch:
                 raise ControllerError("A clean committed baseline is required", code="BLOCKED_DIRTY_BASELINE")
             task = ControllerTask(self.project_id, task_id, title.strip(), spec, json.dumps(config.to_mapping()), local.head, _hash(spec.replace("\r\n", "\n")),
-                require_changes=require_changes, allow_spec_change=allow_spec_change)
-            record = TaskRecord(self.project_id, task_id)
+                require_changes=require_changes, allow_spec_change=allow_spec_change, worker_thread_id=project.codex_worker_thread_id,
+                base_sha=local.head)
+            record = TaskRecord(self.project_id, task_id, base_sha=local.head, worker_thread_id=project.codex_worker_thread_id,
+                worker_session_identity=project.codex_worker_thread_id, worker_repo_path=project.codex_worker_repo_path)
             self.store.state.save(record)
             self.store.storage.create_task(self.project_id, task_id, record)
             task = self._save(task, "TASK_CREATED")
@@ -126,7 +133,27 @@ class TaskController(WorkerManagement):
                 self.publisher = None
             lock.close()
 
+    async def submit_request(self, prompt, *, on_created=None, **options):
+        """One Owner action; identity and title are local, never model-generated."""
+        if not isinstance(prompt, str) or not prompt.strip():
+            raise ControllerError("Enter a work request", code="TASK_SPEC_INVALID")
+        title = " ".join(next(line for line in prompt.splitlines() if line.strip()).split())[:80]
+        task = await self.create_task("job-" + uuid4().hex, title, prompt, **options)
+        if on_created:
+            on_created(task.task_id)
+        return await self.run(task.task_id)
+
     async def _prepare(self, task, config):
+        # Verify the exact thread is idle before writing into its repository.
+        # This performs supported read/resume only, never turn/start.
+        self.worker = self.worker_factory(config, task)
+        try:
+            resumed = await self.worker.resume_task()
+            if resumed != task.worker_thread_id or self.worker.get_session_identity() != task.worker_thread_id:
+                raise ControllerError("Project worker changed before specification commit", code="WORKER_THREAD_MISMATCH")
+        finally:
+            await self.worker.close()
+            self.worker = None
         key = self._key(task, "SPEC_COMMIT", 0)
         payload = {"initial_sha": task.initial_sha, "path": task_spec_path(task.task_id), "digest": task.spec_digest}
         effect = self.store.effect(key)
@@ -340,6 +367,10 @@ class TaskController(WorkerManagement):
                 worker_thread_id=expected["thread_id"], worker_turn_id=expected["turn_id"])
         if kind == "WORKER_FIX":
             await self.publisher.verify_current(PublishedCandidate(**task.published))
+        with ProjectRegistry(self.root) as registry:
+            project = registry.get(self.project_id)
+        if not project.codex_worker_thread_id or task.worker_thread_id != project.codex_worker_thread_id:
+            raise ControllerError("Connect and verify this Project's exact worker", code="PROJECT_WORKER_REQUIRED")
         self._effect(task, key, kind, "PLANNED", payload)
         self._check_control(task)
         counter = {"WORKER_INITIAL": "worker_initial_turns", "WORKER_FIX": "worker_fix_turns",
@@ -350,10 +381,17 @@ class TaskController(WorkerManagement):
                     or (await self.git.run(config.repo.path, "ls-files", "--others", "--exclude-standard", "-z"))[0]
                     or _hash((await self.git.run(config.repo.path, "diff", "HEAD", "--binary"))[0]) != task.pending["diff_digest"]):
                 raise ControllerError("Repository changed before worker continuation", code="TASK_BASELINE_CHANGED")
+        self.worker = self.worker or self.worker_factory(config, task)
+        if task.worker_thread_id:
+            resumed = await self.worker.resume_task()
+            if resumed != task.worker_thread_id:
+                raise ControllerError("Project worker changed", code="WORKER_THREAD_MISMATCH")
+        else:
+            raise ControllerError("Canonical Project worker is missing", code="PROJECT_WORKER_REQUIRED")
+        self._check_control(task)  # Owner may have paused during read/resume.
         # Counter and in-flight intent commit together, before the model call.
         task = self.store.dispatch(task, key, kind, counter)
         self._checkpoint(kind + "_IN_FLIGHT")
-        self.worker = self.worker or self.worker_factory(config, task)
         instruction = task.pending.get("instruction", "Read and implement the canonical specification.")
         prompt = (f"ReviewRelay Task {task.task_id}\nRepository: {config.repo.path}\nCanonical specification: {task_spec_path(task.task_id)}\n"
             "Stay within scope. Run relevant tests. Commit the exact tested state locally and finish with a clean worktree. "
@@ -363,14 +401,14 @@ class TaskController(WorkerManagement):
                else "Continue this exact persisted Task/thread after a proven completed turn:\n" if kind == "WORKER_CONTINUATION"
                else "INITIAL TASK INSTRUCTION:\n")
             + instruction)
-        turn = await self._wait(self.worker.start_task(prompt) if kind == "WORKER_INITIAL" else self.worker.send_instruction(prompt), task, worker=True)
+        turn = await self._wait(self.worker.send_instruction(prompt), task, worker=True)
         thread = self.worker.get_session_identity()
         record = self.store.state.get(self.project_id, task.task_id)
         if not thread or thread != record.worker_thread_id or (task.worker_thread_id and thread != task.worker_thread_id):
             raise ControllerError("Worker thread changed", code="WORKER_THREAD_MISMATCH")
         payload = {**payload, "thread_id": thread, "turn_id": turn}
         self._effect(task, key, kind, "CONFIRMED", payload)
-        task = self._save(task, "CODEX_THREAD_CREATED" if kind == "WORKER_INITIAL" else "WORKER_TURN_STARTED", worker_thread_id=thread, worker_turn_id=turn)
+        task = self._save(task, "WORKER_TURN_STARTED", worker_thread_id=thread, worker_turn_id=turn)
         result = await self._wait(self.worker.wait_until_done(), task, worker=True)
         if result.status is not TurnStatus.COMPLETED or result.thread_id != thread or result.turn_id != turn:
             raise ControllerError("Worker did not complete the bound turn", code="WORKER_COMPLETION_INVALID")

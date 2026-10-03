@@ -117,6 +117,10 @@ class ControllerStore:
     def save(self, task, event):
         task = replace(task, updated_at=utc_now_iso())
         with self.db:
+            if not self.db.in_transaction:
+                self.db.execute("BEGIN IMMEDIATE")
+            if task.state not in {ControllerState.COMPLETE, ControllerState.STOPPED}:
+                self.state.assert_project_available(task.project_id, task.task_id)
             self.db.execute("""INSERT INTO controller_tasks(project_id,task_id,record_json) VALUES(?,?,?)
                 ON CONFLICT(project_id,task_id) DO UPDATE SET record_json=excluded.record_json""",
                 (task.project_id, task.task_id, json.dumps(asdict(task), sort_keys=True)))
@@ -159,6 +163,9 @@ class ControllerStore:
         """Commit the intent, conservative dispatch counter and event together."""
         task = replace(task, counters={**task.counters, counter: task.counters.get(counter, 0) + 1}, updated_at=utc_now_iso())
         with self.db:
+            if not self.db.in_transaction:
+                self.db.execute("BEGIN IMMEDIATE")
+            self.state.assert_project_available(task.project_id, task.task_id)
             self.db.execute("UPDATE controller_effects SET status='IN_FLIGHT',updated_at=? WHERE effect_key=?",
                 (task.updated_at, key))
             self.db.execute("UPDATE controller_tasks SET record_json=? WHERE project_id=? AND task_id=?",

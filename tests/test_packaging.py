@@ -106,6 +106,21 @@ def test_transport_probe_cannot_dispatch_turn_or_send_review():
     assert rpc == ["initialize"]
 
 
+def test_packaged_owner_ui_displays_stored_worker_and_keeps_diagnostics_read_only(app, h, tmp_path):
+    with ProjectRegistry(h.root) as registry:
+        registry.save(replace(h.project, codex_worker_thread_id="stored-owner-worker",
+            codex_worker_repo_path=str(h.repo), codex_worker_title="Owner worker", codex_worker_source="appServer",
+            codex_worker_verified_at="fixture"), event="PROJECT_WORKER_BOUND")
+    (h.root.path / smoke.COPY_MARKER).write_text("disposable fixture")
+    config = dict(data_root=str(h.root.path), project_id=h.project.project_id)
+    output = tmp_path / "owner.json"
+    assert smoke.UiProbe(config, "owner", False, output).run() == 0
+    result = json.loads(output.read_text())
+    assert result["status"] == "PASS" and result["stored_worker_displayed"]
+    assert result["prompt_only"] and result["diagnostics_hidden_by_default"] and result["diagnostics_available"]
+    assert result["durable_unchanged"] and result["codex_inference_turns"] == result["chatgpt_messages_sent"] == 0
+
+
 def test_chatgpt_probe_evaluates_only_read_only_webdriver_and_cannot_send_or_navigate():
     tree = ast.parse((PACKAGING / "reviewrelay_frozen_smoke.py").read_text())
     probe = next(n for n in tree.body if isinstance(n, ast.AsyncFunctionDef) and n.name == "chatgpt_cdp_probe")

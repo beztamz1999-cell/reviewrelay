@@ -99,6 +99,12 @@ class Project:
     reviewer_settings: dict = field(default_factory=dict)
     codex_status: ConnectionStatus = ConnectionStatus.NOT_CONFIGURED
     worker_settings: dict = field(default_factory=dict)
+    codex_worker_thread_id: str | None = None
+    codex_worker_repo_path: str | None = None
+    codex_worker_title: str | None = None
+    codex_worker_source: str | None = None
+    codex_worker_verified_at: str | None = None
+    codex_worker_last_activity: str | None = None
     credential_paths: tuple[str, ...] = ()
     setup: dict = field(default_factory=dict)
     last_error_code: str | None = None
@@ -181,6 +187,22 @@ class ProjectRegistry:
             github_repo_url=github.url if github else None, updated_at=utc_now_iso())
         try:
             with self.state._connection as db:
+                if not db.in_transaction:
+                    db.execute("BEGIN IMMEDIATE")
+                prior = db.execute("SELECT record_json FROM projects WHERE project_id=?", (updated.project_id,)).fetchone()
+                before = Project.from_json(prior[0]) if prior else None
+                if before and before.codex_worker_thread_id != updated.codex_worker_thread_id:
+                    if event != "PROJECT_WORKER_BOUND":
+                        raise ProjectError("Canonical worker may only change through verified discovery", code="PROJECT_WORKER_CHANGED")
+                    self.state.assert_project_available(updated.project_id)
+                if updated.codex_worker_thread_id:
+                    if (not isinstance(updated.codex_worker_repo_path, str) or not updated.codex_worker_repo_path
+                            or local_identity(updated.codex_worker_repo_path) != identity):
+                        raise ProjectError("Worker repository differs", code="PROJECT_WORKER_REPO_MISMATCH")
+                    owner = db.execute("SELECT project_id FROM worker_owners WHERE thread_id=?", (updated.codex_worker_thread_id,)).fetchone()
+                    if owner and owner[0] != updated.project_id:
+                        raise ProjectError("Worker belongs to another Project", code="PROJECT_WORKER_ALREADY_OWNED")
+                    db.execute("INSERT OR IGNORE INTO worker_owners VALUES(?,?)", (updated.codex_worker_thread_id, updated.project_id))
                 db.execute("""INSERT INTO projects VALUES(?,?,?,?) ON CONFLICT(project_id) DO UPDATE SET
                     github_identity=excluded.github_identity, record_json=excluded.record_json""",
                     (updated.project_id, identity, github_key, json.dumps(asdict(updated), sort_keys=True)))

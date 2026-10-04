@@ -133,7 +133,7 @@ GitHub verification precedes reviewer or Codex connection in backend and UI. Rev
 
 Runtime setup requires explicit executable selection; no blind default PATH inference occurs. Resolve/validate the selected executable and perform bounded version, app-server/stdio capability and supported login-status checks. Store executable/model/reasoning defaults, without starting inference or creating a thread. Missing/incompatible executables or auth stop with typed errors. A local check does not prove live account access to the selected model.
 
-The PySide6 Hub supplies Project list/detail, component statuses, New/Existing setup dialogs, GitHub detected/Create/Link choices, visibility/public confirmation, snapshot preview, reviewer/runtime connection, inspect/rename and confirmed unregister. QRunnable/QThreadPool jobs keep Git/GitHub/browser work off the UI thread; busy controls reject duplicate clicks and closing the window during active setup or Task jobs. Errors show safe typed codes and useful explanations. Portable data-root selection is explicit. A ready Project enables the Phase 7 Tasks window. Browser docking, advanced worker panels, polish and packaging remain deferred.
+The PySide6 Hub supplies Project list/detail, component statuses, New/Existing setup dialogs, GitHub detected/Create/Link choices, visibility/public confirmation, snapshot preview, reviewer/runtime connection, inspect/rename and confirmed unregister. QRunnable/QThreadPool jobs keep Git/GitHub/browser work off the UI thread; busy controls reject duplicate clicks and closing the window during active setup or Task jobs. Errors show safe typed codes and useful explanations. Production storage uses one self-managed application-relative data root; normal startup does not ask the Owner to choose a folder. A marked legacy root can be imported only through an explicit one-time Advanced action. A ready Project enables the Phase 7 Tasks window. Browser docking and packaging remain deferred.
 
 ### 0.10 Autonomous Task lifecycle and UI
 
@@ -385,7 +385,7 @@ Worker reports are useful for context but must not replace repository-derived ev
 
 ---
 
-## 7. Portable Storage Requirement
+## 7. Self-Managed Application Storage Requirement
 
 ### 7.1 No primary runtime storage under user profile
 
@@ -398,24 +398,19 @@ ReviewRelay must not use these as its main persistent data location:
 C:\Users\<user>\...
 ```
 
-The user selects a **portable data root** once.
+The packaged application derives one canonical data root from its application layout. It is `<application root>/data`, where the ONEDIR bundle is located at `<application root>/dist/ReviewRelay`. Source launches use the source root. Process cwd, random directories, TEMP, user-folder browsing and drive scanning never select production storage.
 
 Example:
 
 ```text
-G:\REVIEW_RELAY_DATA\
-```
-
-or:
-
-```text
-D:\Tools\ReviewRelayData\
+<application root>\data\
 ```
 
 ### 7.2 Proposed structure
 
 ```text
 <DATA_ROOT>\
+├── .reviewrelay-root
 ├── config\
 │   ├── global.yaml
 │   └── projects\
@@ -438,6 +433,8 @@ D:\Tools\ReviewRelayData\
 │
 └── logs\
 ```
+
+Normal startup creates a missing canonical root and managed subdirectories automatically. An identity marker distinguishes initialized ReviewRelay storage from arbitrary folders that happen to contain `relay.db`. An unmarked non-empty canonical directory or an inaccessible root fails closed; no fallback or automatic legacy search is allowed. Legacy data remains untouched until the Owner invokes the one-time Advanced import. That import preserves the source and excludes the Chrome profile, which must be authenticated manually under the canonical root.
 
 ### 7.3 Durable vs scratch data
 
@@ -1935,7 +1932,7 @@ The following are hard requirements and must not drift during implementation:
 12. **One Task owns one Codex thread; all fixes reuse that exact thread.**
 13. **Automatic loops are bounded.**
 14. **Secrets must be scanned before artifact upload. The broader scanner remains a deferred product requirement, not a Phase 7 implementation claim; credential transfer into configuration/ChatGPT is prohibited. Live autonomous acceptance uses only an explicitly authorized harmless disposable public repository.**
-15. **Primary data lives in a portable user-selected data root.**
+15. **Primary data lives in one application-relative self-managed root; legacy roots require explicit import.**
 16. **Disposable evidence is automatically garbage-collected.**
 17. **ReviewRelay never performs production deployment/release authority actions.**
 18. **Owner remains final authority.**

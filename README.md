@@ -22,17 +22,32 @@ python -m pytest
 
 The full test suite can also be run with `python -m pytest -q`. Source compilation can be checked with `python -m compileall -q src tests`.
 
-## Phase 6 Project Hub and setup
+## Owner workspace
 
-Launch the Project Hub using an explicit portable data folder, kept separate from source repositories:
+Normal startup opens **Dự án của bạn**. Choose **+ Thêm dự án → Project đã có** and select the source folder. The guided wizard reuses repository inspection, proposes detected GitHub repositories, connects the ChatGPT conversation, and offers verified Codex workers by title and recent activity. Existing clean Git repositories need no Git initialization action.
+
+A ready Project opens a chat workspace. Enter a multiline prompt and press **Gửi** (or Ctrl+Enter); Enter inserts a newline. The existing `TaskController.submit_request` creates the internal job and runs the autonomous loop. Durable Owner prompts and verified controller milestones form the chat history. An unfinished Project job disables new requests. Internal identifiers, SHAs, branches, counters and journals stay under **Cài đặt → Chi tiết kỹ thuật**. The earlier technical Project Hub remains available through explicit advanced settings, including initial snapshots and legacy import.
+
+UI acceptance uses synthetic state under OS TEMP, never Gacha's live database or repository. `--packaged-smoke --mode ux` checks the production landing, wizard, visual worker chooser, chat and diagnostics without dispatching a Codex turn or sending ChatGPT. Its screenshots are preview fixtures, not evidence of live transport completion.
+
+## Phase 6 technical Project Hub and setup
+
+The packaged Project Hub automatically uses the installation-relative `data` folder. It does not ask the Owner to choose a location, use the process working directory, or search other drives. A source launch uses the repository root; the packaged ONEDIR build under `dist/ReviewRelay` uses its enclosing application root. Rebuilding the bundle in place keeps the same data root:
 
 ```powershell
-python -m reviewrelay.ui --data-root "G:\REVIEW_RELAY_DATA"
+G:\Relay GPT-CODEX\data\
+    .reviewrelay-root
+    db\relay.db
+    config\
+    active\
+    archive\
+    logs\
+    browser-profile\
 ```
 
-The installed `reviewrelay` command opens the same UI. Without `--data-root`, it asks the Owner to select the portable folder. The optional `ui` dependency supplies PySide6; `dev` includes it for UI regression tests. GitHub setup requires installed, authenticated official `gh` tooling. ReviewRelay neither installs/authenticates it nor reads its credential files. Missing tooling returns `GITHUB_TOOLING_REQUIRED`; missing authentication returns `GITHUB_AUTH_REQUIRED`.
+The root identity marker contains only ReviewRelay/schema version metadata. If the canonical root is inaccessible or contains unmarked data, startup fails closed instead of switching locations. Existing data elsewhere is left untouched. The Owner can explicitly import a selected legacy root once from **Thiết lập nâng cao**; its project/task/configuration files are copied, the source is preserved, and the Chrome profile is not copied. Authentication in the new dedicated profile must be completed manually. The optional `ui` dependency supplies PySide6; `dev` includes it for UI regression tests. GitHub setup requires installed, authenticated official `gh` tooling. ReviewRelay neither installs/authenticates it nor reads its credential files. Missing tooling returns `GITHUB_TOOLING_REQUIRED`; missing authentication returns `GITHUB_AUTH_REQUIRED`.
 
-The setup order is **Create/Import → Local Git → Create/Link/Detect GitHub → Verify repository pair → Reviewer + Codex runtime → PROJECT_READY**. Reviewer and worker controls stay disabled until the repository layer is verified. The Hub shows each component's typed status, canonical GitHub URL, history relationship and any setup error. Git/GitHub/browser checks run outside the UI thread; busy controls prevent duplicate effects. The window cannot close while a setup job is running.
+The setup order is **Create/Import → Local Git → Create/Link/Detect GitHub → Verify repository pair → Reviewer + Codex runtime → PROJECT_READY**. The Hub inspects an existing repository during registration, explains dirty, detached, unborn and nested-root states in Vietnamese, and presents only the next setup action prominently. Git initialization appears only for a folder that is not already a Git repository. Detected GitHub remotes are offered for Owner confirmation; registration never pushes automatically. Secondary technical actions and read-only data-root details are under **Thiết lập nâng cao**. Git/GitHub/browser checks run outside the UI thread; busy controls prevent duplicate effects. The window cannot close while a setup job is running.
 
 ### New Project
 

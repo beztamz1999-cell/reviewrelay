@@ -83,7 +83,7 @@ def test_disposable_packaged_ui_seam_uses_real_qt_bridge_and_recovery_wiring(app
         task_id=task.task_id, candidate_sha=task.candidate_sha, published=task.published,
         conversation_url=h.project.chatgpt_conversation_url)
     output = tmp_path / "result.json"
-    assert smoke.UiProbe(config, mode, False, output).run() == 0
+    assert smoke.UiProbe(config, mode, output).run() == 0
     result = json.loads(output.read_text())
     assert result["status"] == "PASS"
     assert result["codex_inference_turns"] == result["chatgpt_messages_sent"] == 0
@@ -114,7 +114,7 @@ def test_packaged_owner_ui_displays_stored_worker_and_keeps_diagnostics_read_onl
     (h.root.path / smoke.COPY_MARKER).write_text("disposable fixture")
     config = dict(data_root=str(h.root.path), project_id=h.project.project_id)
     output = tmp_path / "owner.json"
-    assert smoke.UiProbe(config, "owner", False, output).run() == 0
+    assert smoke.UiProbe(config, "owner", output).run() == 0
     result = json.loads(output.read_text())
     assert result["status"] == "PASS" and result["stored_worker_displayed"]
     assert result["prompt_only"] and result["diagnostics_hidden_by_default"] and result["diagnostics_available"]
@@ -173,19 +173,18 @@ def test_disposable_chatgpt_probe_records_only_boolean_and_never_dispatches(tmp_
     assert result["codex_inference_turns"] == result["chatgpt_messages_sent"] == 0
 
 
-@pytest.mark.parametrize("chooser", [False, True])
-def test_packaged_main_reads_same_durable_root_via_argument_or_directory_dialog(app, h, tmp_path, chooser):
+def test_packaged_main_reuses_explicit_harness_root_without_a_data_root_dialog(app, h, tmp_path):
     c, task = h.create()
     task = run(c.run(task.task_id))
     c.close()
     (h.root.path / smoke.COPY_MARKER).write_text("disposable fixture")
     config = dict(data_root=str(h.root.path), project_id=task.project_id, task_id=task.task_id)
     output = tmp_path / "ui.json"
-    assert smoke.UiProbe(config, "ui", chooser, output).run() == 0
+    assert smoke.UiProbe(config, "ui", output).run() == 0
     result = json.loads(output.read_text())
     assert result["status"] == "PASS"
     assert Path(result["data_root"]) == h.root.path
     assert result["snapshot"] == result["snapshot_after"]
     assert result["recovery_hidden"]
-    if chooser:
-        assert result["chooser_used"]
+    assert result["data_root_dialog"] == "ABSENT"
+    assert result["advanced_setup_available"] and result["project_worker_card"]

@@ -150,16 +150,56 @@ class ProjectSetupService:
             return await self.initialize_local(project.project_id, confirmed=True)
         return await self.inspect_local(project.project_id)
 
+    @staticmethod
+    def _local_metadata(discovery, classification, error_code=None):
+        if discovery is None:
+            return {"classification": classification, "error_code": error_code}
+        return {
+            "classification": classification,
+            "is_git": bool(discovery.is_git),
+            "head": discovery.head,
+            "branch": discovery.branch,
+            "clean": bool(discovery.clean),
+            "remotes": [{"name": remote.name, "url": remote.repository_url} for remote in discovery.remotes],
+            "error_code": error_code,
+        }
+
+    @staticmethod
+    def _classify_local(discovery):
+        if not discovery.is_git:
+            return "NOT_GIT"
+        if not discovery.head:
+            return "NO_HEAD"
+        if not discovery.branch:
+            return "DETACHED_HEAD"
+        if not discovery.clean:
+            return "DIRTY_WORKTREE"
+        return "CLEAN_READY"
+
     async def inspect_local(self, project_id):
         lock = self._lock(project_id)
         try:
             project = self.registry.get(project_id)
-            discovery = await self.git.discover(project.local_repo_path)
-            ready = discovery.is_git and discovery.head and discovery.clean and discovery.branch
+            try:
+                discovery = await self.git.discover(project.local_repo_path)
+            except ProjectError as exc:
+                classification = "WRONG_REPOSITORY_ROOT" if exc.code == "PROJECT_REPOSITORY_ROOT_REQUIRED" else "OTHER"
+                metadata = self._local_metadata(None, classification, exc.code)
+                return self._save(project, "LOCAL_REPOSITORY_INSPECTION_BLOCKED", local_status=Status.NEEDS_OWNER,
+                    setup={**project.setup, "local_inspection": metadata}, last_error_code=exc.code)
+            classification = self._classify_local(discovery)
+            ready = classification == "CLEAN_READY"
+            metadata = self._local_metadata(discovery, classification)
             return self._save(project, "LOCAL_REPOSITORY_INSPECTED", local_status=Status.READY if ready else Status.NEEDS_OWNER,
-                last_error_code=None if ready else "LOCAL_REPOSITORY_SETUP_REQUIRED")
+                setup={**project.setup, "local_inspection": metadata},
+                last_error_code=None if ready else classification)
         finally:
             lock.close()
+
+    async def local_changes(self, project_id):
+        """Return a read-only short status for Owner inspection."""
+        project = self.registry.get(project_id)
+        return (await self.git.text(project.local_repo_path, "status", "--short", "--untracked-files=all"))
 
     async def initialize_local(self, project_id, *, confirmed=False):
         lock = self._lock(project_id)
@@ -176,8 +216,12 @@ class ProjectSetupService:
                 if plan.files:
                     raise ProjectError("A new empty project must not contain source", code="NEW_PROJECT_NOT_EMPTY")
                 discovery = await self.git.commit_snapshot(plan, confirmed=True)
-            return self._save(project, "LOCAL_REPOSITORY_INITIALIZED", local_status=Status.READY if discovery.head and discovery.clean else Status.NEEDS_OWNER,
-                last_error_code=None if discovery.head else "INITIAL_SNAPSHOT_CONFIRMATION_REQUIRED")
+            classification = self._classify_local(discovery)
+            metadata = self._local_metadata(discovery, classification)
+            return self._save(project, "LOCAL_REPOSITORY_INITIALIZED",
+                local_status=Status.READY if classification == "CLEAN_READY" else Status.NEEDS_OWNER,
+                setup={**project.setup, "local_inspection": metadata},
+                last_error_code=None if classification == "CLEAN_READY" else classification)
         except Exception as exc:
             self._error(project_id, exc, "local")
             raise

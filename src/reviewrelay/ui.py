@@ -11,7 +11,9 @@ from PySide6.QtWidgets import (QApplication, QButtonGroup, QComboBox, QDialog, Q
 
 from .project_setup import ProjectSetupService
 from .projects import ConnectionStatus, ProjectKind, ProjectRegistry
-from .storage import PortableDataRoot
+from .errors import StorageError
+from .legacy_import import import_legacy_data, legacy_import_available
+from .storage import PortableDataRoot, SelfManagedDataRoot
 from .ui_text import state_text
 
 
@@ -290,6 +292,13 @@ class ProjectHub(QMainWindow):
             label.setWordWrap(True)
             label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
             details.addWidget(label)
+        self.owner_guidance = explanation("")
+        details.addWidget(self.owner_guidance)
+        self.next_step_label = QLabel("Tiếp theo:")
+        details.addWidget(self.next_step_label)
+        self.primary_action = QPushButton("Chọn hoặc thêm dự án")
+        self.primary_action.clicked.connect(self.run_next_setup_action)
+        details.addWidget(self.primary_action)
         from .worker_ui import ProjectWorkerCard
         self.worker_card = ProjectWorkerCard(root, lambda: self.project_id,
             lambda work, callback: self.start_job("Kiểm tra Worker", work, callback), self,
@@ -301,13 +310,28 @@ class ProjectHub(QMainWindow):
         self.reviewer_button = QPushButton("Kết nối ChatGPT Reviewer")
         self.codex_button = QPushButton("Kết nối Codex Worker")
         self.refresh_button = QPushButton("Kiểm tra repository local")
+        self.view_changes_button = QPushButton("Xem thay đổi")
         self.unregister_button = QPushButton("Gỡ dự án khỏi ReviewRelay")
         self.tasks_button = QPushButton("Mở dự án — Gửi yêu cầu")
+        self.details_button = QPushButton("Chi tiết kỹ thuật")
+        self.import_legacy_button = QPushButton("Import dữ liệu cũ")
+        self.advanced_toggle = QPushButton("Thiết lập nâng cao")
+        self.advanced_toggle.setCheckable(True)
+        self.advanced_panel = QWidget()
+        self.advanced_panel.hide()
+        advanced_layout = QVBoxLayout(self.advanced_panel)
+        advanced_layout.setContentsMargins(12, 4, 4, 4)
         for button, callback in ((self.initialize_button, self.initialize_git), (self.snapshot_button, self.preview_snapshot),
             (self.github_button, self.configure_github), (self.reviewer_button, self.configure_reviewer),
-            (self.codex_button, self.configure_codex), (self.refresh_button, self.inspect_project), (self.unregister_button, self.unregister_project), (self.tasks_button, self.open_tasks)):
+            (self.codex_button, self.configure_codex), (self.refresh_button, self.inspect_project),
+            (self.view_changes_button, self.view_local_changes), (self.unregister_button, self.unregister_project),
+            (self.tasks_button, self.open_tasks), (self.details_button, self.show_technical_details),
+            (self.import_legacy_button, self.import_legacy_data)):
             button.clicked.connect(callback)
-            details.addWidget(button)
+            advanced_layout.addWidget(button)
+        self.advanced_toggle.toggled.connect(self.advanced_panel.setVisible)
+        details.addWidget(self.advanced_toggle)
+        details.addWidget(self.advanced_panel)
         details.addStretch()
         body.addWidget(detail, 1)
         outer.addLayout(body)
@@ -316,8 +340,10 @@ class ProjectHub(QMainWindow):
         self.message.setWordWrap(True)
         outer.addWidget(self.message)
         self.setCentralWidget(widget)
-        self.controls = [self.create_button, self.rename_button, self.initialize_button, self.snapshot_button,
-            self.github_button, self.reviewer_button, self.codex_button, self.refresh_button, self.unregister_button, self.tasks_button]
+        self.controls = [self.create_button, self.rename_button, self.primary_action, self.advanced_toggle,
+            self.initialize_button, self.snapshot_button, self.github_button, self.reviewer_button,
+            self.codex_button, self.refresh_button, self.view_changes_button, self.unregister_button,
+            self.tasks_button, self.details_button, self.import_legacy_button]
         self.refresh_projects()
 
     @property
@@ -358,25 +384,133 @@ class ProjectHub(QMainWindow):
         if not project:
             self.heading.setText("Chọn hoặc thêm dự án")
             self.name.clear()
+            self._next_action = None
             for label in (self.local_label, self.github_label, self.reviewer_label, self.codex_label):
                 label.clear()
+            self.owner_guidance.clear()
+            self.primary_action.setText("Thêm dự án")
+            self.primary_action.setEnabled(False)
+            import_available = legacy_import_available(self.root)
+            self.advanced_toggle.setEnabled(import_available)
+            self.import_legacy_button.setEnabled(not self.busy and import_available)
+            self.import_legacy_button.setVisible(import_available)
+            self.advanced_panel.hide()
             return
         self.heading.setText("Trạng thái dự án: " + state_text(project.status))
         self.name.setText(project.project_name)
-        self.local_label.setText(f"Repository local: {state_text(project.local_status)}\n{project.local_repo_path}")
+        inspection = project.setup.get("local_inspection", {})
+        classification = inspection.get("classification") or project.last_error_code or (
+            "CLEAN_READY" if project.local_status is ConnectionStatus.READY else "OTHER")
+        local_status = "Sẵn sàng" if project.local_status is ConnectionStatus.READY else "Cần kiểm tra"
+        self.local_label.setText(f"Repository  ● {local_status}")
         relationship = state_text(project.setup.get("relationship", "Chưa kiểm tra"))
-        self.github_label.setText(f"GitHub: {state_text(project.github_status)}\n{project.github_repo_url or 'Chưa thiết lập'}\nQuan hệ lịch sử Git: {relationship}")
-        self.reviewer_label.setText(f"ChatGPT Reviewer: {state_text(project.chatgpt_status)}\n{project.chatgpt_conversation_url or 'Chưa thiết lập'}")
-        self.codex_label.setText(f"Codex Worker: {state_text(project.codex_status)}\n{project.worker_settings.get('executable') or 'Chưa thiết lập'}")
+        self.github_label.setText(f"GitHub  {'●' if project.github_status is ConnectionStatus.READY else '○'} {state_text(project.github_status)}\nQuan hệ lịch sử Git: {relationship}")
+        self.reviewer_label.setText(f"ChatGPT  {'●' if project.chatgpt_status is ConnectionStatus.READY else '○'} {state_text(project.chatgpt_status)}")
+        self.codex_label.setText(f"Codex Worker  {'●' if project.codex_status is ConnectionStatus.READY else '○'} {state_text(project.codex_status)}")
         self.reviewer_button.setEnabled(not self.busy and project.repository_ready)
         self.codex_button.setEnabled(not self.busy and project.repository_ready)
         self.tasks_button.setEnabled(not self.busy and project.ready)
         self.github_button.setEnabled(not self.busy and project.local_status is ConnectionStatus.READY)
         self.github_button.setText("Kiểm tra liên kết GitHub" if project.github_last_verified_at else "Kết nối GitHub")
-        self.initialize_button.setEnabled(not self.busy and project.local_status is not ConnectionStatus.READY)
-        self.snapshot_button.setEnabled(not self.busy and project.last_error_code == "INITIAL_SNAPSHOT_CONFIRMATION_REQUIRED")
-        if not self.busy and project.last_error_code:
-            self.message.setText(project.last_error_code + ": Hoàn tất hoặc xử lý bước thiết lập được chỉ ra.")
+        self.initialize_button.setVisible(classification == "NOT_GIT")
+        self.initialize_button.setEnabled(not self.busy and classification == "NOT_GIT")
+        self.snapshot_button.setVisible(classification == "NO_HEAD")
+        self.snapshot_button.setEnabled(not self.busy and classification == "NO_HEAD")
+        self.view_changes_button.setVisible(classification == "DIRTY_WORKTREE")
+        self.view_changes_button.setEnabled(not self.busy and classification == "DIRTY_WORKTREE")
+        self.refresh_button.setVisible(classification != "NOT_GIT")
+        self.refresh_button.setEnabled(not self.busy)
+        self.unregister_button.setVisible(True)
+        self.tasks_button.setVisible(project.ready)
+        self.import_legacy_button.setVisible(legacy_import_available(self.root))
+        self.advanced_toggle.setEnabled(not self.busy)
+        if classification == "NOT_GIT":
+            self._set_next_action(self.initialize_button, "Khởi tạo repository Git",
+                "Thư mục này chưa phải repository Git. ReviewRelay có thể khởi tạo Git sau khi bạn xác nhận.")
+        elif classification == "NO_HEAD":
+            self._set_next_action(self.snapshot_button, "Xem trước commit ban đầu",
+                "Repository chưa có commit đầu tiên. Xem trước danh sách file trước khi tạo snapshot.")
+        elif classification == "DIRTY_WORKTREE":
+            self._set_next_action(self.view_changes_button, "Xem thay đổi",
+                "Repository đang có thay đổi chưa hoàn tất. ReviewRelay sẽ không chạy Worker tới khi Git ở trạng thái an toàn.")
+        elif classification == "DETACHED_HEAD":
+            self._set_next_action(None, "Chuyển về branch làm việc", "Repository hiện không đứng trên branch. Hãy chuyển về branch làm việc rồi chọn Kiểm tra repository trong Thiết lập nâng cao.")
+        elif classification == "WRONG_REPOSITORY_ROOT":
+            self._set_next_action(None, "Chọn lại thư mục gốc Git", "Bạn đang chọn thư mục con thay vì thư mục gốc Git. Gỡ đăng ký dự án này, rồi thêm lại bằng đúng thư mục gốc.")
+        elif classification == "OTHER":
+            self._set_next_action(self.refresh_button if self.refresh_button.isVisible() else None,
+                "Kiểm tra repository", "ReviewRelay chưa xác định được trạng thái Git an toàn. Hãy kiểm tra thông tin kỹ thuật trước khi tiếp tục.")
+        elif not project.repository_ready:
+            self._set_next_action(self.github_button, self.github_button.text(), "Repository local đã sẵn sàng. Bước tiếp theo là xác nhận kết nối GitHub.")
+        elif project.chatgpt_status is not ConnectionStatus.READY:
+            self._set_next_action(self.reviewer_button, "Kết nối ChatGPT", "GitHub đã sẵn sàng. Bước tiếp theo là chọn cuộc trò chuyện Reviewer.")
+        elif project.codex_status is not ConnectionStatus.READY:
+            self._set_next_action(self.codex_button, "Kết nối Codex", "Reviewer đã sẵn sàng. Bước tiếp theo là kiểm tra Codex Worker.")
+        else:
+            self._set_next_action(self.tasks_button, "Mở dự án — Gửi yêu cầu", "Thiết lập xong. Chọn tác vụ trong cửa sổ dự án.")
+
+    def _set_next_action(self, button, text, guidance):
+        self._next_action = button
+        self.primary_action.setText(text)
+        self.primary_action.setEnabled(not self.busy and button is not None and button.isEnabled())
+        self.owner_guidance.setText(guidance)
+
+    def run_next_setup_action(self):
+        if self._next_action is not None and self.primary_action.isEnabled():
+            self._next_action.click()
+
+    def view_local_changes(self):
+        project_id = self.project_id
+        def viewed(result, error):
+            if error:
+                return
+            dialog = QDialog(self)
+            dialog.setWindowTitle("Thay đổi trong repository")
+            dialog.resize(680, 480)
+            layout = QVBoxLayout(dialog)
+            listing = QTextEdit()
+            listing.setReadOnly(True)
+            listing.setPlainText(result or "Working tree đang sạch.")
+            layout.addWidget(listing)
+            layout.addWidget(dialog_buttons(dialog, "Đóng"))
+            dialog.exec()
+        self.start_job("Đang xem thay đổi Git", self.call_service("local_changes", project_id), viewed)
+
+    def show_technical_details(self):
+        project = self.selected()
+        if not project:
+            return
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Chi tiết kỹ thuật")
+        dialog.resize(680, 420)
+        layout = QVBoxLayout(dialog)
+        details = QTextEdit()
+        details.setReadOnly(True)
+        inspection = project.setup.get("local_inspection", {})
+        lines = [f"Data ReviewRelay: {self.root.path}", f"Project ID: {project.project_id}",
+            f"Repository: {project.local_repo_path}", f"Git blocker: {inspection.get('classification', 'UNKNOWN')}",
+            f"Branch: {inspection.get('branch') or 'NONE'}", f"HEAD: {inspection.get('head') or 'NONE'}"]
+        if inspection.get("error_code"):
+            lines.append(f"Chi tiết kiểm tra: {inspection['error_code']}")
+        details.setPlainText("\n".join(lines))
+        layout.addWidget(details)
+        layout.addWidget(dialog_buttons(dialog, "Đóng"))
+        dialog.exec()
+
+    def import_legacy_data(self):
+        if self.busy or any(window.isVisible() or window.busy for window in self.task_windows):
+            self.message.setText("Đóng các cửa sổ Task trước khi import dữ liệu cũ.")
+            return
+        source = QFileDialog.getExistingDirectory(self, "Chọn thư mục dữ liệu ReviewRelay cũ")
+        if not source:
+            return
+        if confirm_question(self, "Import dữ liệu cũ", "ReviewRelay sẽ nhập Project, Task, cấu hình và lịch sử một lần. Thư mục nguồn được giữ nguyên; profile Chrome không được sao chép và cần đăng nhập thủ công lại.") != QMessageBox.StandardButton.Yes:
+            return
+        def imported(result, error):
+            if not error:
+                self.refresh_projects()
+                self.message.setText("Đã import dữ liệu cũ. Nguồn cũ vẫn được giữ nguyên.")
+        self.start_job("Đang import dữ liệu cũ", lambda: import_legacy_data(source, self.root), imported)
 
     def start_job(self, label, work, callback=None):
         if self.busy:
@@ -544,14 +678,21 @@ class ProjectHub(QMainWindow):
 
 
 def main():
+    from .owner_ui import OwnerMainWindow
     parser = argparse.ArgumentParser(description="ReviewRelay Project Hub")
-    parser.add_argument("--data-root", help="Explicit portable ReviewRelay data folder (otherwise choose it in the UI)")
     args = parser.parse_args()
     app = QApplication.instance() or QApplication([])
-    folder = args.data_root or QFileDialog.getExistingDirectory(None, "Chọn thư mục dữ liệu ReviewRelay")
-    if not folder:
-        return 0
-    window = ProjectHub(PortableDataRoot(folder))
+    try:
+        root = SelfManagedDataRoot.for_application().create()
+        window = OwnerMainWindow(root)
+    except Exception as exc:
+        box = QMessageBox(QMessageBox.Icon.Critical, "Không thể mở dữ liệu ReviewRelay",
+            "Không thể mở dữ liệu ReviewRelay tại thư mục ứng dụng. Dữ liệu không được chuyển sang vị trí khác.",
+            QMessageBox.StandardButton.Ok)
+        box.setTextFormat(Qt.TextFormat.PlainText)
+        box.setDetailedText(str(exc))
+        box.exec()
+        return 2
     window.show()
     return app.exec()
 

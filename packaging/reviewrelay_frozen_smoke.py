@@ -229,8 +229,8 @@ async def transport_probe(config):
 
 
 class UiProbe:
-    def __init__(self, config, mode, chooser, output):
-        self.config, self.mode, self.chooser, self.output = config, mode, chooser, output
+    def __init__(self, config, mode, output):
+        self.config, self.mode, self.output = config, mode, output
         self.root = disposable_root(config["data_root"] if mode in {"ui", "owner"} else config["fixture_root"])
         self.app = QApplication.instance() or QApplication([])
         self.app.setQuitOnLastWindowClosed(False)
@@ -264,7 +264,8 @@ class UiProbe:
 
     def tick_ui(self):
         if self.window is None:
-            hubs = [w for w in self.app.topLevelWidgets() if isinstance(w, ProjectHub) and w.isVisible()]
+            hubs = [w for w in self.app.topLevelWidgets() if isinstance(w, ProjectHub) and w.isVisible()
+                and w.root.path.resolve() == self.root.path.resolve()]
             if not hubs:
                 return
             self.window = hubs[0]
@@ -280,6 +281,8 @@ class UiProbe:
             task_window = self.window.task_windows[-1]
             if (self.window.windowTitle() != "ReviewRelay — Dự án"
                     or self.window.create_button.text() != "+ Thêm dự án"
+                    or self.window.advanced_toggle.text() != "Thiết lập nâng cao"
+                    or not self.window.worker_card.isVisible()
                     or task_window.windowTitle() != "ReviewRelay — Công việc"
                     or task_window.manual_button.text() != "Gửi chỉ dẫn thủ công"):
                 raise ValueError("Vietnamese Hub/Task UI differs")
@@ -307,6 +310,7 @@ class UiProbe:
             self.result.update(data_root=str(self.root.path), projects=ids,
                 task_summary=task_window.summary.text(), worker_identity=task_window.worker_identity.text(),
                 timeline_present=True, recovery_hidden=not task_window.recovery_button.isVisible(),
+                data_root_dialog="ABSENT", advanced_setup_available=True, project_worker_card=True,
                 snapshot=self.before, snapshot_after=durable_snapshot(self.root))
             if self.result["snapshot_after"] != self.before:
                 raise ValueError("UI read altered durable state")
@@ -497,49 +501,50 @@ class UiProbe:
             return self.app.exec()
         import reviewrelay.ui as ui_module
         from reviewrelay.ui import main as ui_main
+        # Keep the earlier technical-window fixture coverage available. The
+        # production Owner presentation is accepted separately by mode "ux".
+        import reviewrelay.owner_ui as owner_ui
         original_hub = ui_module.ProjectHub
+        original_owner = owner_ui.OwnerMainWindow
         original_args = sys.argv
+        from reviewrelay.storage import SelfManagedDataRoot
+        original_factory = SelfManagedDataRoot.__dict__["for_application"]
         original_chooser = QFileDialog.getExistingDirectory
-        def choose(parent, caption):
-            dialog = QFileDialog(parent, caption, str(self.root.path))
-            dialog.setOption(QFileDialog.Option.DontUseNativeDialog)
-            dialog.setFileMode(QFileDialog.FileMode.Directory)
-            def select():
-                dialog.setDirectory(str(self.root.path))
-                dialog.accept()
-            QTimer.singleShot(500, select)
-            accepted = dialog.exec() == QDialog.DialogCode.Accepted
-            self.result["chooser_used"] = accepted
-            return dialog.selectedFiles()[0] if accepted else ""
+        def unexpected_chooser(*_args, **_kwargs):
+            self.result["data_root_dialog"] = "PRESENT"
+            raise ValueError("Normal startup must not show a data-root chooser")
         try:
             # This acceptance mode reads a marked fixture; it must not refresh
             # operational worker metadata or leave background discovery alive.
-            ui_module.ProjectHub = lambda root: original_hub(root, auto_discover=False)
-            sys.argv = [sys.executable] + ([] if self.chooser else ["--data-root", str(self.root.path)])
-            if self.chooser:
-                QFileDialog.getExistingDirectory = choose
+            owner_ui.OwnerMainWindow = lambda root: original_hub(root, auto_discover=False)
+            SelfManagedDataRoot.for_application = classmethod(lambda cls: self.root)
+            sys.argv = [sys.executable]
+            QFileDialog.getExistingDirectory = unexpected_chooser
             return ui_main()
         finally:
-            ui_module.ProjectHub = original_hub
+            owner_ui.OwnerMainWindow = original_owner
             sys.argv = original_args
+            SelfManagedDataRoot.for_application = original_factory
             QFileDialog.getExistingDirectory = original_chooser
 
 
 def main():
     parser = argparse.ArgumentParser(description="Explicit read-only packaged acceptance")
     parser.add_argument("--packaged-smoke", action="store_true", required=True)
-    parser.add_argument("--mode", choices=("ui", "owner", "approval", "recovery", "transports", "chatgpt"), required=True)
+    parser.add_argument("--mode", choices=("ui", "owner", "ux", "approval", "recovery", "transports", "chatgpt"), required=True)
     parser.add_argument("--config", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument("--chooser", action="store_true")
     args = parser.parse_args()
     config = json.loads(args.config.read_text(encoding="utf-8"))
     output = args.output.resolve()
     if not output.parent.is_dir():
         raise ValueError("Acceptance output directory must explicitly exist")
     try:
+        if args.mode == "ux":
+            from reviewrelay_owner_smoke import run_owner_smoke
+            return run_owner_smoke(config, output)
         if args.mode not in {"transports", "chatgpt"}:
-            return UiProbe(config, args.mode, args.chooser, output).run()
+            return UiProbe(config, args.mode, output).run()
         config["diagnostics_dir"] = str(output.parent)
         result = asyncio.run(chatgpt_cdp_probe(config) if args.mode == "chatgpt" else transport_probe(config))
         passed = result["status"] == "PASS" if args.mode == "chatgpt" else result["chatgpt_cdp"]["status"] != "FAIL"

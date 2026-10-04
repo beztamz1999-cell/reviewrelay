@@ -191,6 +191,7 @@ def test_existing_non_git_initialization_and_snapshot_require_bound_confirmation
     with make() as service:
         project = run(service.register("Import", str(folder), "EXISTING"))
         assert not (folder / ".git").exists() and project.local_status is Status.NEEDS_OWNER
+        assert project.setup["local_inspection"]["classification"] == "NOT_GIT"
         with pytest.raises(ProjectError):
             run(service.initialize_local(project.project_id))
         run(service.initialize_local(project.project_id, confirmed=True))
@@ -209,7 +210,49 @@ def test_existing_non_git_initialization_and_snapshot_require_bound_confirmation
         assert committed.local_status is Status.READY
         assert "ignored.txt" not in git(folder, "ls-tree", "--name-only", "HEAD")
         assert (folder / "ignored.txt").read_text() == "leave untouched"
-    assert not recorder.pushes
+
+
+def test_existing_clean_repository_is_ready_immediately_and_detects_remote_without_publishing(setup):
+    _, repo, _, _, recorder, _, make = setup
+    git(repo, "remote", "add", "origin", "https://github.com/owner/existing-project.git")
+    with make() as service:
+        project = run(service.register("Existing", str(repo), ProjectKind.EXISTING))
+        inspection = project.setup["local_inspection"]
+        assert project.local_status is Status.READY
+        assert inspection["classification"] == "CLEAN_READY"
+        assert inspection["remotes"] == [{"name": "origin", "url": "https://github.com/owner/existing-project"}]
+        assert not recorder.pushes
+
+
+@pytest.mark.parametrize("case,expected", [
+    ("dirty", "DIRTY_WORKTREE"),
+    ("detached", "DETACHED_HEAD"),
+    ("unborn", "NO_HEAD"),
+    ("nested", "WRONG_REPOSITORY_ROOT"),
+])
+def test_existing_repository_registration_persists_owner_readable_git_blocker(setup, tmp_path, case, expected):
+    _, repo, _, _, _, _, make = setup
+    path = repo
+    if case == "dirty":
+        (repo / "owner-change.txt").write_text("keep me", encoding="utf-8")
+    elif case == "detached":
+        git(repo, "checkout", "--detach", "HEAD")
+    elif case == "unborn":
+        path = tmp_path / "unborn"
+        path.mkdir()
+        git(path, "init", "--initial-branch=main")
+    elif case == "nested":
+        path = repo / "nested"
+        path.mkdir()
+    with make() as service:
+        project = run(service.register("Blocked", str(path), ProjectKind.EXISTING))
+        assert project.local_status is Status.NEEDS_OWNER
+        assert project.setup["local_inspection"]["classification"] == expected
+        if case == "nested":
+            assert project.setup["local_inspection"]["error_code"] == "PROJECT_REPOSITORY_ROOT_REQUIRED"
+        else:
+            assert project.setup["local_inspection"]["is_git"] is True
+        assert not service.git.runner.pushes
 
 
 @pytest.mark.parametrize("transport", ["https://github.com/owner/project.git", "git@github.com:owner/project.git", "ssh://git@github.com/owner/project.git"])

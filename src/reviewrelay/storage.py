@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 import tempfile
 from dataclasses import asdict
 from pathlib import Path, PurePath
@@ -16,6 +17,24 @@ from .models import TaskRecord
 
 _DATA_DIRS = ("config", "browser-profile", "db", "active", "archive", "logs")
 _SCRATCH_DIRS = ("patch", "source", "grep", "tests", "upload")
+_ROOT_MARKER = ".reviewrelay-root"
+_ROOT_MARKER_VERSION = 1
+
+
+def application_root(*, executable: str | Path | None = None, frozen: bool | None = None) -> Path:
+    """Resolve the installation root independently of cwd.
+
+    The supported ONEDIR layout is ``<application root>/dist/ReviewRelay``;
+    source launches use the repository/package root. Rebuilding the bundle in
+    place therefore keeps the same data location.
+    """
+    frozen = bool(getattr(sys, "frozen", False)) if frozen is None else frozen
+    if frozen:
+        binary = Path(executable or sys.executable).expanduser().resolve()
+        if len(binary.parents) < 3:
+            raise StorageError("Cannot resolve the ReviewRelay application directory")
+        return binary.parents[2]
+    return Path(__file__).resolve().parents[2]
 
 
 class PortableDataRoot:
@@ -54,6 +73,66 @@ class PortableDataRoot:
         from .config import store_project_config
 
         return store_project_config(config, self)
+
+
+class SelfManagedDataRoot(PortableDataRoot):
+    """Application-relative production data root with a persistent identity."""
+
+    def __init__(self, app_root: str | Path | None = None) -> None:
+        self.app_root = Path(app_root).expanduser().absolute() if app_root is not None else application_root()
+        super().__init__(self.app_root / "data")
+
+    @classmethod
+    def for_application(cls) -> "SelfManagedDataRoot":
+        return cls()
+
+    @property
+    def marker_path(self) -> Path:
+        return self.path / _ROOT_MARKER
+
+    def create(self) -> "SelfManagedDataRoot":
+        try:
+            self.path.mkdir(parents=True, exist_ok=True)
+            self.path = self.path.resolve(strict=True)
+            marker = self.marker_path
+            if marker.is_symlink():
+                raise StorageError("ReviewRelay data identity marker must not be a symbolic link")
+            if marker.exists():
+                self._read_marker(marker)
+            else:
+                # Never adopt an existing relay.db or arbitrary directory. An
+                # interrupted first run is recoverable only after the marker
+                # has been written, before creating any managed subdirectories.
+                if any(self.path.iterdir()):
+                    raise StorageError(
+                        f"Không thể mở dữ liệu ReviewRelay tại thư mục ứng dụng: {self.path}"
+                    )
+                self._write_marker(marker, {"application": "ReviewRelay", "marker_version": _ROOT_MARKER_VERSION,
+                    "schema_version": 1})
+            for name in _DATA_DIRS:
+                self.safe_path(name).mkdir(parents=True, exist_ok=True)
+            return self
+        except StorageError:
+            raise
+        except OSError as exc:
+            raise StorageError(
+                f"Không thể mở dữ liệu ReviewRelay tại thư mục ứng dụng: {self.path}"
+            ) from exc
+
+    def _read_marker(self, path: Path) -> dict[str, Any]:
+        try:
+            marker = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            raise StorageError(f"Invalid ReviewRelay data identity marker: {path}") from exc
+        if (not isinstance(marker, dict) or marker.get("application") != "ReviewRelay"
+                or marker.get("marker_version") != _ROOT_MARKER_VERSION
+                or marker.get("schema_version") != 1):
+            raise StorageError(f"Unsupported ReviewRelay data identity marker: {path}")
+        return marker
+
+    def _write_marker(self, path: Path, values: dict[str, Any]) -> None:
+        rendered = json.dumps(values, sort_keys=True, indent=2) + "\n"
+        _atomic_write(path, rendered.encode("utf-8"))
 
 
 class TaskStorage:

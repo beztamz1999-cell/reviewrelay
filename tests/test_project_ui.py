@@ -4,6 +4,7 @@ import os
 import threading
 import time
 from dataclasses import replace
+from pathlib import Path
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
@@ -15,6 +16,7 @@ from PySide6.QtWidgets import QApplication, QDialogButtonBox, QLabel, QMessageBo
 from reviewrelay.project_git import DetectedRemote
 from reviewrelay.projects import ConnectionStatus as Status, ProjectError, ProjectRegistry
 from reviewrelay.storage import PortableDataRoot
+from reviewrelay.storage import SelfManagedDataRoot
 from reviewrelay.ui import CreateProjectDialog, GitHubSetupDialog, ProjectHub, ReviewerDialog, RuntimeDialog
 
 
@@ -56,13 +58,113 @@ def test_project_hub_connect_controls_follow_typed_repository_readiness(hub, app
             github_repo_url="https://github.com/owner/project", github_last_verified_at="fixture-check"))
     window.refresh_projects()
     assert window.reviewer_button.isEnabled() and window.codex_button.isEnabled()
-    assert "https://github.com/owner/project" in window.github_label.text()
+    assert "https://github.com/owner/project" not in window.github_label.text()
+    assert "Kết nối ChatGPT" in window.primary_action.text()
     assert "Sẵn sàng" not in window.heading.text()
     with ProjectRegistry(root) as registry:
         registry.save(replace(verified, chatgpt_status=Status.READY, codex_status=Status.READY,
             chatgpt_conversation_url="https://chatgpt.com/c/ui-fixture", worker_settings={"executable": "fixture.exe"}))
     window.refresh_projects()
     assert "Sẵn sàng" in window.heading.text()
+
+
+def _set_local_inspection(root, project, classification):
+    metadata = {"classification": classification, "is_git": classification != "NOT_GIT",
+        "head": "a" * 40 if classification in {"CLEAN_READY", "DIRTY_WORKTREE", "DETACHED_HEAD"} else None,
+        "branch": "main" if classification != "DETACHED_HEAD" else None,
+        "clean": classification != "DIRTY_WORKTREE"}
+    with ProjectRegistry(root) as registry:
+        return registry.save(replace(project, local_status=Status.READY if classification == "CLEAN_READY" else Status.NEEDS_OWNER,
+            last_error_code=None if classification == "CLEAN_READY" else classification,
+            setup={**project.setup, "local_inspection": metadata}))
+
+
+def test_existing_git_repository_does_not_offer_git_init_and_uses_progressive_next_step(hub, app):
+    window, root, project = hub
+    _set_local_inspection(root, project, "CLEAN_READY")
+    window.refresh_projects()
+    assert window.primary_action.text() == "Kết nối GitHub"
+    assert "Git init" not in window.primary_action.text()
+    window.advanced_toggle.setChecked(True)
+    app.processEvents()
+    assert not window.initialize_button.isVisible()
+    assert window.refresh_button.isVisible()
+    assert window.advanced_panel.isVisible()
+
+
+@pytest.mark.parametrize("classification,primary,visible_button,guidance", [
+    ("NOT_GIT", "Khởi tạo repository Git", "initialize_button", "chưa phải repository Git"),
+    ("NO_HEAD", "Xem trước commit ban đầu", "snapshot_button", "chưa có commit đầu tiên"),
+    ("DIRTY_WORKTREE", "Xem thay đổi", "view_changes_button", "thay đổi chưa hoàn tất"),
+    ("DETACHED_HEAD", "Chuyển về branch làm việc", None, "không đứng trên branch"),
+    ("WRONG_REPOSITORY_ROOT", "Chọn lại thư mục gốc Git", None, "thư mục con"),
+])
+def test_local_repository_blockers_have_owner_language_and_safe_next_step(hub, app, classification, primary, visible_button, guidance):
+    window, root, project = hub
+    _set_local_inspection(root, project, classification)
+    window.refresh_projects()
+    assert window.primary_action.text() == primary
+    assert guidance.lower() in window.owner_guidance.text().lower()
+    window.advanced_toggle.setChecked(True)
+    app.processEvents()
+    if visible_button:
+        assert getattr(window, visible_button).isVisible()
+    assert not window.initialize_button.isVisible() if classification != "NOT_GIT" else window.initialize_button.isVisible()
+
+
+def test_setup_primary_action_advances_github_chatgpt_codex_then_tasks(hub, app):
+    window, root, project = hub
+    local = _set_local_inspection(root, project, "CLEAN_READY")
+    window.refresh_projects()
+    assert window.primary_action.text() == "Kết nối GitHub"
+    with ProjectRegistry(root) as registry:
+        github = registry.save(replace(local, github_status=Status.READY,
+            github_repo_url="https://github.com/owner/project", github_last_verified_at="fixture"))
+    window.refresh_projects()
+    assert window.primary_action.text() == "Kết nối ChatGPT"
+    with ProjectRegistry(root) as registry:
+        reviewer = registry.save(replace(github, chatgpt_status=Status.READY,
+            chatgpt_conversation_url="https://chatgpt.com/c/fixture"))
+    window.refresh_projects()
+    assert window.primary_action.text() == "Kết nối Codex"
+    with ProjectRegistry(root) as registry:
+        ready = registry.save(replace(reviewer, codex_status=Status.READY,
+            worker_settings={"executable": "codex.exe"}))
+    window.refresh_projects()
+    assert ready.ready and window.primary_action.text() == "Mở dự án — Gửi yêu cầu"
+    assert window.worker_card.isVisible()
+
+
+def test_main_uses_self_managed_root_without_showing_a_data_root_chooser(app, tmp_path, monkeypatch):
+    import sys
+    import reviewrelay.ui as ui
+    root = SelfManagedDataRoot(tmp_path / "install")
+    seen = []
+    class Window:
+        def show(self):
+            seen.append("shown")
+    monkeypatch.setattr(sys, "argv", ["ReviewRelay"])
+    monkeypatch.setattr(ui.SelfManagedDataRoot, "for_application", classmethod(lambda cls: root))
+    monkeypatch.setattr(ui.QFileDialog, "getExistingDirectory", lambda *args: pytest.fail("normal startup opened a chooser"))
+    monkeypatch.setattr("reviewrelay.owner_ui.OwnerMainWindow", lambda selected: (seen.append(selected.path), Window())[1])
+    monkeypatch.setattr(QApplication, "exec", lambda self: 0)
+    assert ui.main() == 0
+    assert root.path in [entry for entry in seen if isinstance(entry, Path)]
+    assert "shown" in seen
+
+
+def test_main_shows_owner_readable_error_and_does_not_fallback(app, tmp_path, monkeypatch):
+    import sys
+    import reviewrelay.ui as ui
+    root = SelfManagedDataRoot(tmp_path / "unavailable")
+    monkeypatch.setattr(sys, "argv", ["ReviewRelay"])
+    monkeypatch.setattr(ui.SelfManagedDataRoot, "for_application", classmethod(lambda cls: root))
+    monkeypatch.setattr(root, "create", lambda: (_ for _ in ()).throw(OSError("blocked")))
+    shown = []
+    monkeypatch.setattr(QMessageBox, "exec", lambda self: shown.append((self.text(), self.detailedText())) or 0)
+    assert ui.main() == 2
+    assert "Không thể mở dữ liệu ReviewRelay" in shown[0][0]
+    assert "blocked" in shown[0][1]
 
 
 def test_create_dialog_requires_explicit_new_existing_and_new_github_choice(app):
